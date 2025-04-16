@@ -517,6 +517,6 @@ def run_sampling(
             max_results=max_results,
             model_client=model_client,
         )
-        dfs = list(pool.map(func, mols))
-
+        # dfs = list(pool.map(func, mols))
+        dfs = [func(mol) for mol in mols]
     return pd.concat(dfs, ignore_index=True)

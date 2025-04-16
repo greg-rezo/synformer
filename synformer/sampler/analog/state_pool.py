@@ -1,6 +1,7 @@
 import copy
 import dataclasses
 import itertools
+import logging
 import time
 from collections.abc import Iterable
 from functools import cached_property
@@ -21,6 +22,8 @@ from synformer.data.collate import (
 )
 from synformer.data.common import TokenType, featurize_stack
 from synformer.models.model_server import SynformerClient
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
@@ -179,6 +182,12 @@ class StatePool:
                 self._finished.append(base_state)
 
             elif tok_next == TokenType.REACTANT:
+                if j >= len(top_reactants[i]):
+                    logger.warning(
+                        f"Not enough reactants for state {i}, j={j} >= {len(top_reactants[i])}"
+                    )
+                    continue
+
                 reactant, mol_idx, score = top_reactants[i][j]
                 new_state = copy.deepcopy(base_state)
                 new_state.stack.push_mol(reactant, mol_idx)

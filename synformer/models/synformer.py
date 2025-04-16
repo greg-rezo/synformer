@@ -54,9 +54,14 @@ class PredictResult:
         return self
 
     def best_token(self) -> list[TokenType]:
-        return [TokenType(t) for t in self.token_logits.argmax(dim=-1).detach().cpu().tolist()]
+        return [
+            TokenType(t)
+            for t in self.token_logits.argmax(dim=-1).detach().cpu().tolist()
+        ]
 
-    def top_reactions(self, topk: int, rxn_matrix: ReactantReactionMatrix) -> list[list[_ReactionItem]]:
+    def top_reactions(
+        self, topk: int, rxn_matrix: ReactantReactionMatrix
+    ) -> list[list[_ReactionItem]]:
         topk = min(topk, self.reaction_logits.size(-1))
         logit, index = self.reaction_logits.topk(topk, dim=-1, largest=True)
         bsz = logit.size(0)
@@ -147,7 +152,9 @@ class GenerateResult:
                     rxn = self.reactions[i][j]
                     if rxn is None:
                         break
-                    success = stacks[i].push_rxn(rxn, int(self.rxn_indices[i, j].item()))
+                    success = stacks[i].push_rxn(
+                        rxn, int(self.rxn_indices[i, j].item())
+                    )
                     if not success:
                         break
                 elif self.token_types[i, j] == TokenType.REACTANT:
@@ -169,8 +176,12 @@ class Synformer(nn.Module):
         self.d_model: int = self.encoder.dim
 
         self.token_head = ClassifierHead(self.d_model, max(TokenType) + 1)
-        self.reaction_head = ClassifierHead(self.d_model, cfg.decoder.num_reaction_classes)
-        self.fingerprint_head = get_fingerprint_head(cfg.fingerprint_head_type, cfg.fingerprint_head)
+        self.reaction_head = ClassifierHead(
+            self.d_model, cfg.decoder.num_reaction_classes
+        )
+        self.fingerprint_head = get_fingerprint_head(
+            cfg.fingerprint_head_type, cfg.fingerprint_head
+        )
 
     def encode(self, batch: ProjectionBatch):
         return self.encoder(batch)
@@ -204,7 +215,9 @@ class Synformer(nn.Module):
         # NOTE: token_padding_mask is True for padding tokens: ~token_padding_mask[:, :-1].contiguous()
         # We set the mask to None so the model perfers producing the `END` token when the embedding makes no sense
         loss_dict["token"] = self.token_head.get_loss(h, token_types_gt, None)
-        loss_dict["reaction"] = self.reaction_head.get_loss(h, rxn_indices_gt, token_types_gt == TokenType.REACTION)
+        loss_dict["reaction"] = self.reaction_head.get_loss(
+            h, rxn_indices_gt, token_types_gt == TokenType.REACTION
+        )
 
         fp_loss, fp_aux = self.fingerprint_head.get_loss(
             h,
@@ -220,15 +233,15 @@ class Synformer(nn.Module):
     def get_loss_shortcut(self, batch: ProjectionBatch, **options):
         code, code_padding_mask, encoder_loss_dict = self.encode(batch)
         loss_dict, aux_dict = self.get_loss(
-            code=code,
-            code_padding_mask=code_padding_mask,
-            token_types=batch["token_types"],
-            rxn_indices=batch["rxn_indices"],
-            reactant_fps=batch["reactant_fps"],
-            token_padding_mask=batch["token_padding_mask"],
+            code=code,  # type: ignore
+            code_padding_mask=code_padding_mask,  # type: ignore
+            token_types=batch["token_types"],  # type: ignore
+            rxn_indices=batch["rxn_indices"],  # type: ignore
+            reactant_fps=batch["reactant_fps"],  # type: ignore
+            token_padding_mask=batch["token_padding_mask"],  # type: ignore
             **options,
         )
-        loss_dict.update(encoder_loss_dict)
+        loss_dict.update(encoder_loss_dict)  # type: ignore
         return loss_dict, aux_dict
 
     def get_log_likelihood(
@@ -254,9 +267,15 @@ class Synformer(nn.Module):
         rxn_indices_gt = rxn_indices[:, 1:].contiguous()
         reactant_fps_gt = reactant_fps[:, 1:].contiguous()
 
-        ll_token_types = self.token_head.get_log_likelihood(h, token_types_gt, ~token_padding_mask[:, 1:])
-        ll_rxn = self.reaction_head.get_log_likelihood(h, rxn_indices_gt, token_types_gt == TokenType.REACTION)
-        ll_bb = self.fingerprint_head.get_log_likelihood(h, reactant_fps_gt, token_types_gt == TokenType.REACTANT)
+        ll_token_types = self.token_head.get_log_likelihood(
+            h, token_types_gt, ~token_padding_mask[:, 1:]
+        )
+        ll_rxn = self.reaction_head.get_log_likelihood(
+            h, rxn_indices_gt, token_types_gt == TokenType.REACTION
+        )
+        ll_bb = self.fingerprint_head.get_log_likelihood(
+            h, reactant_fps_gt, token_types_gt == TokenType.REACTANT
+        )
         ll = ll_token_types + ll_rxn + ll_bb
         return {
             "token": ll_token_types,
@@ -268,12 +287,12 @@ class Synformer(nn.Module):
     def get_log_likelihood_shortcut(self, batch: ProjectionBatch, **options):
         code, code_padding_mask, _ = self.encode(batch)
         return self.get_log_likelihood(
-            code=code,
-            code_padding_mask=code_padding_mask,
-            token_types=batch["token_types"],
-            rxn_indices=batch["rxn_indices"],
-            reactant_fps=batch["reactant_fps"],
-            token_padding_mask=batch["token_padding_mask"],
+            code=code,  # type: ignore
+            code_padding_mask=code_padding_mask,  # type: ignore
+            token_types=batch["token_types"],  # type: ignore
+            rxn_indices=batch["rxn_indices"],  # type: ignore
+            reactant_fps=batch["reactant_fps"],  # type: ignore
+            token_padding_mask=batch["token_padding_mask"],  # type: ignore
             **options,
         )
 
@@ -306,7 +325,9 @@ class Synformer(nn.Module):
             torch.nn.functional.softmax(token_logits / temperature_token, dim=-1),
             num_samples=1,
         )
-        reaction_logits = self.reaction_head.predict(h_next)[..., : len(rxn_matrix.reactions)]
+        reaction_logits = self.reaction_head.predict(h_next)[
+            ..., : len(rxn_matrix.reactions)
+        ]
         retrieved_reactants = self.fingerprint_head.retrieve_reactants(
             h_next,
             fpindex,
@@ -314,7 +335,9 @@ class Synformer(nn.Module):
             mask=token_sampled == TokenType.REACTANT,
             **options,
         )
-        return PredictResult(token_logits, token_sampled, reaction_logits, retrieved_reactants)
+        return PredictResult(
+            token_logits, token_sampled, reaction_logits, retrieved_reactants
+        )
 
     @torch.no_grad()
     def generate_without_stack(
@@ -329,22 +352,50 @@ class Synformer(nn.Module):
         **options,
     ):
         code, code_padding_mask, _ = self.encode(batch)
-        bsz = code.size(0)
+        bsz = code.size(0)  # type: ignore
         fp_dim = self.fingerprint_head.fingerprint_dim
 
-        token_padding_mask = torch.full([bsz, 1], fill_value=False, dtype=torch.bool, device=code.device)
-        token_types = torch.full([bsz, 1], fill_value=TokenType.START, dtype=torch.long, device=code.device)
-        rxn_indices = torch.full([bsz, 1], fill_value=0, dtype=torch.long, device=code.device)
-        reactant_fps = torch.zeros([bsz, 1, fp_dim], dtype=torch.float, device=code.device)
-        predicted_fps = torch.zeros([bsz, 1, fp_dim], dtype=torch.float, device=code.device)
-        reactant_indices = torch.full([bsz, 1], fill_value=-1, dtype=torch.long, device=code.device)
+        token_padding_mask = torch.full(
+            [bsz, 1],
+            fill_value=False,
+            dtype=torch.bool,
+            device=code.device,  # type: ignore
+        )
+        token_types = torch.full(
+            [bsz, 1],
+            fill_value=TokenType.START,
+            dtype=torch.long,
+            device=code.device,  # type: ignore
+        )
+        rxn_indices = torch.full(
+            [bsz, 1],
+            fill_value=0,
+            dtype=torch.long,
+            device=code.device,  # type: ignore
+        )
+        reactant_fps = torch.zeros(
+            [bsz, 1, fp_dim],
+            dtype=torch.float,
+            device=code.device,  # type: ignore
+        )
+        predicted_fps = torch.zeros(
+            [bsz, 1, fp_dim],
+            dtype=torch.float,
+            device=code.device,  # type: ignore
+        )
+        reactant_indices = torch.full(
+            [bsz, 1],
+            fill_value=-1,
+            dtype=torch.long,
+            device=code.device,  # type: ignore
+        )
         reactants: list[list[Molecule | None]] = [[None] for _ in range(bsz)]
         reactions: list[list[Reaction | None]] = [[None] for _ in range(bsz)]
 
         for _ in tqdm(range(max_len - 1)):
             pred = self.predict(
-                code=code,
-                code_padding_mask=code_padding_mask,
+                code=code,  # type: ignore
+                code_padding_mask=code_padding_mask,  # type: ignore
                 token_types=token_types,
                 rxn_indices=rxn_indices,
                 reactant_fps=reactant_fps,
@@ -357,14 +408,18 @@ class Synformer(nn.Module):
             token_padding_mask_next = torch.logical_or(
                 token_types[:, -1:] == TokenType.END, token_padding_mask[:, -1:]
             )
-            token_padding_mask = torch.cat([token_padding_mask, token_padding_mask_next], dim=-1)
+            token_padding_mask = torch.cat(
+                [token_padding_mask, token_padding_mask_next], dim=-1
+            )
 
             token_next = pred.token_sampled
             token_types = torch.cat([token_types, token_next], dim=-1)
 
             # Reaction
             rxn_idx_next = torch.multinomial(
-                torch.nn.functional.softmax(pred.reaction_logits / temperature_reaction, dim=-1),
+                torch.nn.functional.softmax(
+                    pred.reaction_logits / temperature_reaction, dim=-1
+                ),
                 num_samples=1,
             )[..., 0]
             rxn_indices = torch.cat([rxn_indices, rxn_idx_next[..., None]], dim=-1)
@@ -373,7 +428,9 @@ class Synformer(nn.Module):
 
             # Reactant (building block)
             fp_scores = (
-                torch.from_numpy(1.0 / (pred.retrieved_reactants.distance + 1e-4)).to(reactant_fps).reshape(bsz, -1)
+                torch.from_numpy(1.0 / (pred.retrieved_reactants.distance + 1e-4))
+                .to(reactant_fps)
+                .reshape(bsz, -1)
             )
             fp_idx_next = torch.multinomial(
                 torch.nn.functional.softmax(fp_scores / temperature_reactant, dim=-1),
@@ -399,15 +456,19 @@ class Synformer(nn.Module):
                 .to(reactant_indices)
                 .reshape(bsz, -1)[range(bsz), fp_idx_next]
             )
-            reactant_indices = torch.cat([reactant_indices, ridx_next[..., None]], dim=-1)
+            reactant_indices = torch.cat(
+                [reactant_indices, ridx_next[..., None]], dim=-1
+            )
 
-            reactant_next = pred.retrieved_reactants.reactants.reshape(bsz, -1)[range(bsz), fp_idx_next.cpu().numpy()]
+            reactant_next = pred.retrieved_reactants.reactants.reshape(bsz, -1)[
+                range(bsz), fp_idx_next.cpu().numpy()
+            ]
             for b, m in enumerate(reactant_next):
                 reactants[b].append(m)
 
         return GenerateResult(
-            code=code,
-            code_padding_mask=code_padding_mask,
+            code=code,  # type: ignore
+            code_padding_mask=code_padding_mask,  # type: ignore
             token_types=token_types,
             token_padding_mask=token_padding_mask,
             rxn_indices=rxn_indices,

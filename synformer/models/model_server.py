@@ -19,7 +19,7 @@ from synformer.chem.fpindex import FingerprintIndex
 from synformer.chem.matrix import ReactantReactionMatrix
 from synformer.models.synformer import Synformer
 
-SERVER_PORT = 8765
+SERVER_PORT = 8766
 logger = logging.getLogger(__name__)
 
 
@@ -48,13 +48,15 @@ class SynformerClient:
             data = pickle.dumps(input_dict)
 
             # Send data length and data
+            logger.debug(f"Client sending data length: {len(data)}")
             sock.sendall(struct.pack(">I", len(data)))
             sock.sendall(data)
 
             # Get response length and data
             msg_len_bytes = sock.recv(4)
+            logger.debug(f"Client received message: {msg_len_bytes}")
             msg_len = struct.unpack(">I", msg_len_bytes)[0]
-
+            logger.debug(f"Client received message length: {msg_len}")
             data = b""
             while len(data) < msg_len:
                 packet = sock.recv(min(msg_len - len(data), 4096))
@@ -92,20 +94,17 @@ class SynformerServer:
 
     def start(self):
         """Start the socket server in a new process"""
-        self.server_process = mp.Process(
-            target=self._run_server, args=(self.model, self.fpindex, self.rxn_matrix)
-        )
+        mp_context = mp.get_context("spawn")
+        self.server_process = mp_context.Process(target=self._run_server)
         self.server_process.start()
         # Wait briefly to ensure server is running
         time.sleep(1)
 
-    def _run_server(
-        self,
-        model: Synformer,
-        fpindex: FingerprintIndex,
-        rxn_matrix: ReactantReactionMatrix,
-    ):
+    def _run_server(self):
         """Load model and serve predictions via socket"""
+        logging.basicConfig(level=logging.DEBUG)
+        logger.debug(f"Server starting on {self.host}:{self.port}")
+
         # Create socket server
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -117,9 +116,11 @@ class SynformerServer:
             try:
                 # Get message length (4 bytes)
                 msg_len_bytes = conn.recv(4)
+                logger.debug(f"Server received message: {msg_len_bytes}")
                 if not msg_len_bytes:
                     continue
                 msg_len = struct.unpack(">I", msg_len_bytes)[0]
+                logger.debug(f"Server received message length: {msg_len}")
 
                 # Receive the data
                 data = b""
@@ -133,13 +134,23 @@ class SynformerServer:
                     # Process request
                     request = pickle.loads(data)
                     encode = request.pop("encode")
+                    item_dict = {
+                        k: v.to(self.device)
+                        for k, v in request.items()
+                        if isinstance(v, torch.Tensor)
+                    }
                     if encode:
-                        result = self.model.encode(**request)
+                        result = self.model.encode(item_dict)  # type: ignore
                     else:
-                        result = self.model.predict(**request)
+                        result = self.model.predict(
+                            **item_dict,  # type: ignore
+                            fpindex=self.fpindex,
+                            rxn_matrix=self.rxn_matrix,
+                        )
 
                     # Send response
                     result_data = pickle.dumps(result)
+                    logger.debug(f"Server sending data length: {len(result_data)}")
                     conn.sendall(struct.pack(">I", len(result_data)))
                     conn.sendall(result_data)
             finally:
