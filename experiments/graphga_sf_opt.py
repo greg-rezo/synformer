@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+import time
 from pathlib import Path
 
 import crossover as co
@@ -16,7 +17,8 @@ from tdc.generation import MolGen
 from tdc.metadata import single_molecule_dataset_names
 
 from synformer.chem.mol import Molecule
-from synformer.sampler.analog.parallel import run_parallel_sampling_return_smiles
+from synformer.models.model_server import SynformerClient, SynformerServer
+from synformer.sampler.analog.parallel import run_sampling
 
 rdBase.DisableLog("rdApp.error")
 
@@ -113,7 +115,12 @@ class Oracle:
         with open(output_file_path, "w") as f:
             yaml.dump(self.mol_buffer, f, sort_keys=False)
 
-    def log_intermediate(self, mols=None, scores=None, finish=False):
+    def log_intermediate(
+        self,
+        mols: list[Mol] | None = None,
+        scores: list[float] | None = None,
+        finish: bool = False,
+    ):
         if finish:
             temp_top100 = list(self.mol_buffer.items())[:100]
             smis = [item[0] for item in temp_top100]
@@ -143,16 +150,17 @@ class Oracle:
                     n_calls = self.max_oracle_calls
             else:
                 # Otherwise, log the input moleucles
+                assert mols is not None
                 smis = [Chem.MolToSmiles(m) for m in mols]
                 n_calls = len(self.mol_buffer)
 
         # Uncomment this line if want to log top-10 moelucles figures, so as the best_mol key values.
         # temp_top10 = list(self.mol_buffer.items())[:10]
 
-        avg_top1 = np.max(scores)
-        avg_top10 = np.mean(sorted(scores, reverse=True)[:10])
-        avg_top100 = np.mean(scores)
-        avg_sa = np.mean(self.oracle(smis))
+        avg_top1 = np.max(scores)  # type: ignore
+        avg_top10 = np.mean(sorted(scores, reverse=True)[:10])  # type: ignore
+        avg_top100 = np.mean(scores)  # type: ignore
+        avg_sa = np.mean(self.oracle(smis))  # type: ignore
         diversity_top100 = self.evaluator(smis)
 
         logger.info(
@@ -211,7 +219,7 @@ class Oracle:
                 pass
             else:
                 self.mol_buffer[smi] = [
-                    float(self.evaluator(smi)),
+                    float(self.evaluator(smi)),  # type: ignore
                     len(self.mol_buffer) + 1,
                 ]
             return self.mol_buffer[smi][0]
@@ -290,22 +298,25 @@ def reproduce(mating_pool, mutation_rate):
         return parent_a
 
 
-def projection(smiles_list: list[str], model_path: Path):
+def projection(smiles_list: list[str], model_client: SynformerClient) -> list[str]:
+    t = time.perf_counter()
     input = [Molecule(s) for s in smiles_list]
-    result_df = run_parallel_sampling_return_smiles(
-        input=input,
-        model_path=model_path,
+    result_df = run_sampling(
+        mols=input,
         search_width=24,
         exhaustiveness=64,
-        num_gpus=-1,
-        num_workers_per_gpu=1,
-        task_qsize=0,
-        result_qsize=0,
         time_limit=180,
         sort_by_scores=True,
+        model_client=model_client,
     )
     result_df.drop_duplicates(subset="target", inplace=True, keep="first")
-    return result_df.smiles.to_list()
+    out_smiles_list = result_df.smiles.to_list()
+
+    logger.info(
+        f"Projection returned {len(out_smiles_list)} in "
+        f"{time.perf_counter() - t:.2f} seconds"
+    )
+    return out_smiles_list
 
 
 if __name__ == "__main__":
@@ -331,6 +342,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+    matrix_path = args.model_path.parent.parent / "matrix.pkl"
+    fpindex_path = args.model_path.parent.parent / "fpindex.pkl"
+
+    model_server = SynformerServer(
+        model_path=args.model_path,
+        fpindex_path=fpindex_path,
+        rxn_matrix_path=matrix_path,
+        device="cuda",  # type: ignore
+    )
+    model_server.start()
 
     oracle = Oracle(
         args=args,
@@ -343,13 +364,15 @@ if __name__ == "__main__":
     pool = joblib.Parallel(n_jobs=64)
 
     data = MolGen(name=args.mol_dataset)
-    all_smiles = data.get_data().smiles.to_list()
+    all_smiles = data.get_data().smiles.to_list()  # type: ignore
     starting_population = np.random.choice(all_smiles, args.population_size)
 
     # select initial population
     # population_smiles = heapq.nlargest(config["population_size"], starting_population, key=oracle)
     population_smiles = starting_population
-    population_smiles = projection(population_smiles, model_path=args.model_path)
+    population_smiles = projection(
+        population_smiles, model_client=model_server.get_client()
+    )
     population_mol = [Chem.MolFromSmiles(s) for s in population_smiles]
     population_scores = oracle([Chem.MolToSmiles(mol) for mol in population_mol])
 
@@ -368,9 +391,11 @@ if __name__ == "__main__":
         mating_pool = make_mating_pool(
             population_mol, population_scores, args.population_size
         )
-        offspring_mol = pool(
-            delayed(reproduce)(mating_pool, args.mutation_rate)
-            for _ in range(args.offspring_size)
+        offspring_mol = list(
+            pool(
+                delayed(reproduce)(mating_pool, args.mutation_rate)
+                for _ in range(args.offspring_size)
+            )
         )
 
         # add new_population
@@ -380,14 +405,14 @@ if __name__ == "__main__":
             Chem.MolFromSmiles(smi)
             for smi in projection(
                 [Chem.MolToSmiles(mol) for mol in population_mol],
-                model_path=args.model_path,
+                model_client=model_server.get_client(),
             )
         ]
 
         # stats
         old_scores = population_scores
         population_scores = oracle([Chem.MolToSmiles(mol) for mol in population_mol])
-        population_tuples = list(zip(population_scores, population_mol))
+        population_tuples = list(zip(population_scores, population_mol))  # type: ignore
         population_tuples = sorted(population_tuples, key=lambda x: x[0], reverse=True)[
             : args.population_size
         ]

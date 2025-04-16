@@ -4,6 +4,9 @@ import os
 import pathlib
 import pickle
 import subprocess
+import time
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 from multiprocessing import synchronize as sync
 from typing import TypeAlias
 
@@ -15,6 +18,7 @@ from tqdm.auto import tqdm
 from synformer.chem.fpindex import FingerprintIndex
 from synformer.chem.matrix import ReactantReactionMatrix
 from synformer.chem.mol import FingerprintOption, Molecule
+from synformer.models.model_server import SynformerClient
 from synformer.models.synformer import Synformer
 from synformer.sampler.analog.state_pool import StatePool, TimeLimit
 
@@ -37,6 +41,7 @@ class Worker(mp.Process):
         max_evolve_steps: int = 12,
         max_results: int = 100,
         time_limit: int = 120,
+        server=None,
     ):
         super().__init__()
         self._model_path = model_path
@@ -44,6 +49,7 @@ class Worker(mp.Process):
         self._result_queue = result_queue
         self._gpu_id = gpu_id
         self._gpu_lock = gpu_lock
+        self._server = server
 
         self._state_pool_opt = state_pool_opt or {}
         self._max_evolve_steps = max_evolve_steps
@@ -54,17 +60,32 @@ class Worker(mp.Process):
         os.sched_setaffinity(0, range(os.cpu_count() or 1))
         os.environ["CUDA_VISIBLE_DEVICES"] = self._gpu_id
 
-        ckpt = torch.load(self._model_path, map_location="cpu")
-        config = OmegaConf.create(ckpt["hyper_parameters"]["config"])
-        model = Synformer(config.model).to("cuda")
-        model.load_state_dict({k[6:]: v for k, v in ckpt["state_dict"].items()})
-        model.eval()
-        self._model = model
+        if self._server is None:
+            ckpt = torch.load(self._model_path, map_location="cpu")
+            config = OmegaConf.create(ckpt["hyper_parameters"]["config"])
+            model = Synformer(config.model).to("cuda")
+            model.load_state_dict({k[6:]: v for k, v in ckpt["state_dict"].items()})
+            model.eval()
+            self._model = model
 
-        self._fpindex: FingerprintIndex = pickle.load(open(config.chem.fpindex, "rb"))
-        self._rxn_matrix: ReactantReactionMatrix = pickle.load(
-            open(config.chem.rxn_matrix, "rb")
-        )
+            self._fpindex: FingerprintIndex = pickle.load(
+                open(config.chem.fpindex, "rb")
+            )
+            self._rxn_matrix: ReactantReactionMatrix = pickle.load(
+                open(config.chem.rxn_matrix, "rb")
+            )
+        else:
+            ckpt = torch.load(self._model_path, map_location="cpu")
+            config = OmegaConf.create(ckpt["hyper_parameters"]["config"])
+            model = Synformer(config.model).eval()
+            self._model = model
+
+            self._fpindex: FingerprintIndex = pickle.load(
+                open(config.chem.fpindex, "rb")
+            )
+            self._rxn_matrix: ReactantReactionMatrix = pickle.load(
+                open(config.chem.rxn_matrix, "rb")
+            )
 
         try:
             while True:
@@ -88,15 +109,12 @@ class Worker(mp.Process):
 
     def process(self, mol: Molecule):
         sampler = StatePool(
-            fpindex=self._fpindex,
-            rxn_matrix=self._rxn_matrix,
             mol=mol,
-            model=self._model,
             **self._state_pool_opt,
         )
         tl = TimeLimit(self._time_limit)
         for _ in range(self._max_evolve_steps):
-            sampler.evolve(gpu_lock=self._gpu_lock, show_pbar=False, time_limit=tl)
+            sampler.evolve(show_pbar=False, time_limit=tl)
             max_sim = max(
                 [
                     p.molecule.sim(
@@ -168,22 +186,18 @@ class WorkerPool:
 class WorkerNoStop(mp.Process):
     def __init__(
         self,
-        model_path: pathlib.Path,
         task_queue: TaskQueueType,
         result_queue: ResultQueueType,
-        gpu_id: str,
-        gpu_lock: sync.Lock,
+        model_client: SynformerClient,
         state_pool_opt: dict | None = None,
         max_evolve_steps: int = 12,
         max_results: int = 100,
         time_limit: int = 120,
     ):
         super().__init__()
-        self._model_path = model_path
+        self._model_client = model_client
         self._task_queue = task_queue
         self._result_queue = result_queue
-        self._gpu_id = gpu_id
-        self._gpu_lock = gpu_lock
 
         self._state_pool_opt = state_pool_opt or {}
         self._max_evolve_steps = max_evolve_steps
@@ -191,21 +205,6 @@ class WorkerNoStop(mp.Process):
         self._time_limit = time_limit
 
     def run(self) -> None:
-        os.sched_setaffinity(0, range(os.cpu_count() or 1))
-        os.environ["CUDA_VISIBLE_DEVICES"] = self._gpu_id
-
-        ckpt = torch.load(self._model_path, map_location="cpu")
-        config = OmegaConf.create(ckpt["hyper_parameters"]["config"])
-        model = Synformer(config.model).to("cuda")
-        model.load_state_dict({k[6:]: v for k, v in ckpt["state_dict"].items()})
-        model.eval()
-        self._model = model
-
-        self._fpindex: FingerprintIndex = pickle.load(open(config.chem.fpindex, "rb"))
-        self._rxn_matrix: ReactantReactionMatrix = pickle.load(
-            open(config.chem.rxn_matrix, "rb")
-        )
-
         try:
             while True:
                 next_task = self._task_queue.get()
@@ -228,15 +227,13 @@ class WorkerNoStop(mp.Process):
 
     def process(self, mol: Molecule):
         sampler = StatePool(
-            fpindex=self._fpindex,
-            rxn_matrix=self._rxn_matrix,
             mol=mol,
-            model=self._model,
+            model_client=self._model_client,
             **self._state_pool_opt,
         )
         tl = TimeLimit(self._time_limit)
         for _ in range(self._max_evolve_steps):
-            sampler.evolve(gpu_lock=self._gpu_lock, show_pbar=False, time_limit=tl)
+            sampler.evolve(show_pbar=False, time_limit=tl)
 
         df = sampler.get_dataframe()[: self._max_results]
         return df
@@ -245,7 +242,7 @@ class WorkerNoStop(mp.Process):
 class WorkerPoolNoStop:
     def __init__(
         self,
-        gpu_ids: list[int | str],
+        model_client: SynformerClient,
         num_workers_per_gpu: int,
         task_qsize: int,
         result_qsize: int,
@@ -254,16 +251,13 @@ class WorkerPoolNoStop:
         super().__init__()
         self._task_queue: TaskQueueType = mp.JoinableQueue(task_qsize)
         self._result_queue: ResultQueueType = mp.Queue(result_qsize)
-        self._gpu_ids = [str(d) for d in gpu_ids]
-        self._gpu_locks = [mp.Lock() for _ in gpu_ids]
-        num_gpus = len(gpu_ids)
-        num_workers = num_workers_per_gpu * num_gpus
+        self._model_client = model_client
+        num_workers = num_workers_per_gpu
         self._workers = [
             WorkerNoStop(
                 task_queue=self._task_queue,
                 result_queue=self._result_queue,
-                gpu_id=self._gpu_ids[i % num_gpus],
-                gpu_lock=self._gpu_locks[i % num_gpus],
+                model_client=self._model_client,
                 **worker_opt,
             )
             for i in range(num_workers)
@@ -415,12 +409,12 @@ def run_parallel_sampling_return_smiles(
     df_merge = pd.concat(df_all, ignore_index=True)
     pool.end()
 
-    return df_merge
+    return df_merge  # type: ignore
 
 
 def run_parallel_sampling_return_smiles_no_early_stop(
     input: list[Molecule],
-    model_path: pathlib.Path,
+    model_client: SynformerClient,
     search_width: int = 24,
     exhaustiveness: int = 64,
     num_gpus: int = -1,
@@ -432,11 +426,10 @@ def run_parallel_sampling_return_smiles_no_early_stop(
 ) -> None:
     num_gpus = num_gpus if num_gpus > 0 else _count_gpus()
     pool = WorkerPoolNoStop(
-        gpu_ids=list(range(num_gpus)),
+        model_client=model_client,
         num_workers_per_gpu=num_workers_per_gpu,
         task_qsize=task_qsize,
         result_qsize=result_qsize,
-        model_path=model_path,
         state_pool_opt={
             "factor": search_width,
             "max_active_states": exhaustiveness,
@@ -460,47 +453,24 @@ def run_parallel_sampling_return_smiles_no_early_stop(
     df_merge = pd.concat(df_all, ignore_index=True)
     pool.end()
 
-    return df_merge
+    return df_merge  # type: ignore
 
 
-def run_sampling_one_cpu(
-    input: Molecule,
-    model_path: pathlib.Path,
-    mat_path: pathlib.Path,
-    fpi_path: pathlib.Path,
-    search_width: int = 24,
-    exhaustiveness: int = 64,
-    time_limit: int = 180,
-    max_results: int = 100,
-    max_evolve_steps: int = 12,
-    sort_by_scores: bool = True,
+def _run_sampling_molecule(
+    mol: Molecule,
+    state_pool_opt: dict,
+    time_limit: int,
+    max_evolve_steps: int,
+    max_results: int,
+    model_client: SynformerClient,
 ) -> pd.DataFrame:
-    ckpt = torch.load(model_path, map_location="cpu")
-    config = OmegaConf.create(ckpt["hyper_parameters"]["config"])
-    model = Synformer(config.model)
-    model.load_state_dict({k[6:]: v for k, v in ckpt["state_dict"].items()})
-    model.eval()
-    _model = model
-
-    state_pool_opt = {
-        "factor": search_width,
-        "max_active_states": exhaustiveness,
-        "sort_by_score": sort_by_scores,
-    }
-    _fpindex: FingerprintIndex = pickle.load(open(fpi_path, "rb"))
-    _rxn_matrix: ReactantReactionMatrix = pickle.load(open(mat_path, "rb"))
-
+    logging.basicConfig(level=logging.DEBUG)
     try:
-        sampler = StatePool(
-            fpindex=_fpindex,
-            rxn_matrix=_rxn_matrix,
-            mol=input,
-            model=_model,
-            **state_pool_opt,
-        )
+        logging.info(f"Sampling {mol.smiles}")
+        sampler = StatePool(mol=mol, **state_pool_opt, model_client=model_client)
         tl = TimeLimit(time_limit)
         for _ in range(max_evolve_steps):
-            sampler.evolve(gpu_lock=None, show_pbar=False, time_limit=tl)
+            sampler.evolve(show_pbar=False, time_limit=tl)
             max_sim = max(
                 [
                     p.molecule.sim(
@@ -514,13 +484,39 @@ def run_sampling_one_cpu(
                 break
 
         df = sampler.get_dataframe()[:max_results]
-
-        # if len(df) == 0:
-        #     logger.infof"{input.smiles}: No results for {next_task.smiles}")
-        # else:
-        #     max_sim = df["score"].max()
-        #     logger.info(f"{input.smiles}: {max_sim:.3f} {next_task.smiles}")
+        logging.info(f"Samples {len(df)} for {mol.smiles}")
+        return df
     except KeyboardInterrupt:
-        logger.warning("Exiting due to KeyboardInterrupt")
+        return pd.DataFrame()
 
-    return df
+
+def run_sampling(
+    mols: list[Molecule],
+    model_client: SynformerClient,
+    search_width: int = 24,
+    exhaustiveness: int = 64,
+    time_limit: int = 180,
+    max_results: int = 100,
+    max_evolve_steps: int = 12,
+    sort_by_scores: bool = True,
+) -> pd.DataFrame:
+    logger.info(f"Running sampling for {len(mols)} molecules")
+
+    state_pool_opt = {
+        "factor": search_width,
+        "max_active_states": exhaustiveness,
+        "sort_by_score": sort_by_scores,
+    }
+
+    with ProcessPoolExecutor(mp_context=mp.get_context("spawn"), max_workers=8) as pool:
+        func = partial(
+            _run_sampling_molecule,
+            state_pool_opt=state_pool_opt,
+            time_limit=time_limit,
+            max_evolve_steps=max_evolve_steps,
+            max_results=max_results,
+            model_client=model_client,
+        )
+        dfs = list(pool.map(func, mols))
+
+    return pd.concat(dfs, ignore_index=True)

@@ -11,7 +11,6 @@ import torch
 from tqdm.auto import tqdm
 
 from synformer.chem.fpindex import FingerprintIndex
-from synformer.chem.matrix import ReactantReactionMatrix
 from synformer.chem.mol import FingerprintOption, Molecule
 from synformer.chem.stack import Stack
 from synformer.data.collate import (
@@ -21,7 +20,7 @@ from synformer.data.collate import (
     collate_tokens,
 )
 from synformer.data.common import TokenType, featurize_stack
-from synformer.models.synformer import Synformer
+from synformer.models.model_server import SynformerClient
 
 
 @dataclasses.dataclass
@@ -62,29 +61,22 @@ class TimeLimit:
 class StatePool:
     def __init__(
         self,
-        fpindex: FingerprintIndex,
-        rxn_matrix: ReactantReactionMatrix,
         mol: Molecule,
-        model: Synformer,
+        model_client: SynformerClient,
         factor: int = 16,
         max_active_states: int = 256,
         sort_by_score: bool = True,
     ) -> None:
-        super().__init__()
-        self._fpindex = fpindex
-        self._rxn_matrix = rxn_matrix
-
-        self._model = model
+        self._model_client = model_client
         self._mol = mol
-        device = next(iter(model.parameters())).device
         atoms, bonds = mol.featurize_simple()
-        self._atoms = atoms[None].to(device)
-        self._bonds = bonds[None].to(device)
+        self._atoms = atoms[None]
+        self._bonds = bonds[None]
         num_atoms = atoms.size(0)
-        self._atom_padding_mask = torch.zeros([1, num_atoms], dtype=torch.bool, device=device)
+        self._atom_padding_mask = torch.zeros([1, num_atoms], dtype=torch.bool)
 
         smiles = mol.tokenize_csmiles()
-        self._smiles = smiles[None].to(device)
+        self._smiles = smiles[None]
 
         self._factor = factor
         self._max_active_states = max_active_states
@@ -95,19 +87,16 @@ class StatePool:
         self._aborted: list[State] = []
 
     @cached_property
-    def device(self) -> torch.device:
-        return self._atoms.device
-
-    @cached_property
     def code(self) -> tuple[torch.Tensor, torch.Tensor]:
         with torch.inference_mode():
-            code, code_padding_mask, encoder_loss_dict = self._model.encode(
+            code, code_padding_mask, encoder_loss_dict = self._model_client.predict(
                 {
                     "atoms": self._atoms,
                     "bonds": self._bonds,
                     "atom_padding_mask": self._atom_padding_mask,
                     "smiles": self._smiles,
-                }
+                },
+                encode=True,
             )
             return code, code_padding_mask
 
@@ -116,18 +105,21 @@ class StatePool:
             self._active.sort(key=lambda s: s.score, reverse=True)
         self._active = self._active[: self._max_active_states]
 
-    def _collate(self, feat_list: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    def _collate(
+        self, feat_list: list[dict[str, torch.Tensor]]
+    ) -> dict[str, torch.Tensor]:
         spec_tokens = {
             "token_types": collate_tokens,
             "rxn_indices": collate_tokens,
             "reactant_fps": collate_1d_features,
             "token_padding_mask": collate_padding_masks,
         }
-        return apply_collate(spec_tokens, feat_list, feat_list[0]["token_types"].size(0))
+        return apply_collate(
+            spec_tokens, feat_list, feat_list[0]["token_types"].size(0)
+        )
 
     def evolve(
         self,
-        gpu_lock: Lock | None = None,
         show_pbar: bool = False,
         time_limit: TimeLimit | None = None,
     ) -> None:
@@ -137,16 +129,14 @@ class StatePool:
             featurize_stack(
                 state.stack,
                 end_token=False,
-                fpindex=self._fpindex,
+                fpindex=self._model_client.fpindex,
             )
             for state in self._active
         ]
 
-        if gpu_lock is not None:
-            gpu_lock.acquire()
+        feat = {k: v for k, v in self._collate(feat_list).items()}
 
-        feat = {k: v.to(self.device) for k, v in self._collate(feat_list).items()}
-
+        # Get code and padding mask for the batch
         code, code_padding_mask = self.code
         code_size = list(code.size())
         code_size[0] = len(feat_list)
@@ -155,20 +145,16 @@ class StatePool:
         mask_size[0] = len(feat_list)
         code_padding_mask = code_padding_mask.expand(mask_size)
 
-        result = self._model.predict(
-            code=code,
-            code_padding_mask=code_padding_mask,
-            token_types=feat["token_types"],
-            rxn_indices=feat["rxn_indices"],
-            reactant_fps=feat["reactant_fps"],
-            rxn_matrix=self._rxn_matrix,
-            fpindex=self._fpindex,
-            topk=self._factor,
-            result_device=torch.device("cpu"),
-        )
-
-        if gpu_lock is not None:
-            gpu_lock.release()
+        input_data = {
+            "code": code,
+            "code_padding_mask": code_padding_mask,
+            "token_types": feat["token_types"],
+            "rxn_indices": feat["rxn_indices"],
+            "reactant_fps": feat["reactant_fps"],
+            "topk": self._factor,
+            "result_device": torch.device("cpu"),
+        }
+        result = self._model_client.predict(input_data)
 
         n = code.size(0)
         m = self._factor
@@ -178,7 +164,9 @@ class StatePool:
 
         best_token = result.best_token()
         top_reactants = result.top_reactants(topk=m)
-        top_reactions = result.top_reactions(topk=m, rxn_matrix=self._rxn_matrix)
+        top_reactions = result.top_reactions(
+            topk=m, rxn_matrix=self._model_client.rxn_matrix
+        )
 
         next: list[State] = []
         for i, j in nm_iter:
@@ -200,10 +188,15 @@ class StatePool:
             elif tok_next == TokenType.REACTION:
                 reaction, rxn_idx, score = top_reactions[i][j]
                 new_state = copy.deepcopy(base_state)
-                success = new_state.stack.push_rxn(reaction, rxn_idx, product_limit=None)
+                success = new_state.stack.push_rxn(
+                    reaction, rxn_idx, product_limit=None
+                )
                 if success:
                     rxn_score = max(
-                        [self._mol.sim(m, fp_option=FingerprintOption.rdkit()) for m in new_state.stack.get_top()]
+                        [
+                            self._mol.sim(m, fp_option=FingerprintOption.rdkit())
+                            for m in new_state.stack.get_top()
+                        ]
                     )
                     new_state.scores.append(rxn_score)
                     next.append(new_state)
@@ -235,7 +228,10 @@ class StatePool:
                 {
                     "target": self._mol.smiles,
                     "smiles": product.molecule.smiles,
-                    "score": self._mol.sim(product.molecule, FingerprintOption.morgan_for_tanimoto_similarity()),
+                    "score": self._mol.sim(
+                        product.molecule,
+                        FingerprintOption.morgan_for_tanimoto_similarity(),
+                    ),
                     "synthesis": product.stack.get_action_string(),
                     "num_steps": product.stack.count_reactions(),
                 }
@@ -248,8 +244,12 @@ class StatePool:
                 mol.scaffold,
                 fp_option=FingerprintOption.morgan_for_tanimoto_similarity(),
             )
-            row["pharm2d_sim"] = self._mol.dice_similarity(mol, fp_option=FingerprintOption.gobbi_pharm2d())
-            row["rdkit_sim"] = self._mol.tanimoto_similarity(mol, fp_option=FingerprintOption.rdkit())
+            row["pharm2d_sim"] = self._mol.dice_similarity(
+                mol, fp_option=FingerprintOption.gobbi_pharm2d()
+            )
+            row["rdkit_sim"] = self._mol.tanimoto_similarity(
+                mol, fp_option=FingerprintOption.rdkit()
+            )
 
         df = pd.DataFrame(rows)
         return df
