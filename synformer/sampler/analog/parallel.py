@@ -1,3 +1,4 @@
+import logging
 import multiprocessing as mp
 import os
 import pathlib
@@ -19,6 +20,9 @@ from synformer.sampler.analog.state_pool import StatePool, TimeLimit
 
 TaskQueueType: TypeAlias = "mp.JoinableQueue[Molecule | None]"
 ResultQueueType: TypeAlias = "mp.Queue[tuple[Molecule, pd.DataFrame]]"
+
+
+logger = logging.getLogger(__name__)
 
 
 class Worker(mp.Process):
@@ -72,12 +76,14 @@ class Worker(mp.Process):
                 self._task_queue.task_done()
                 self._result_queue.put((next_task, result_df))
                 if len(result_df) == 0:
-                    print(f"{self.name}: No results for {next_task.smiles}")
+                    logger.info(f"{self.name}: No results for {next_task.smiles}")
                 else:
                     max_sim = result_df["score"].max()
-                    print(f"{self.name}: {max_sim:.3f} {next_task.smiles}")
+                    logger.info(
+                        f"{self.name}: max_sim={max_sim:.3f} smiles={next_task.smiles}"
+                    )
         except KeyboardInterrupt:
-            print(f"{self.name}: Exiting due to KeyboardInterrupt")
+            logger.warning(f"{self.name}: Exiting due to KeyboardInterrupt")
             return
 
     def process(self, mol: Molecule):
@@ -210,12 +216,14 @@ class WorkerNoStop(mp.Process):
                 self._task_queue.task_done()
                 self._result_queue.put((next_task, result_df))
                 if len(result_df) == 0:
-                    print(f"{self.name}: No results for {next_task.smiles}")
+                    logger.info(f"{self.name}: No results for {next_task.smiles}")
                 else:
                     max_sim = result_df["score"].max()
-                    print(f"{self.name}: {max_sim:.3f} {next_task.smiles}")
+                    logger.info(
+                        f"{self.name}: max_sim={max_sim:.3f} smiles={next_task.smiles}"
+                    )
         except KeyboardInterrupt:
-            print(f"{self.name}: Exiting due to KeyboardInterrupt")
+            logger.warning(f"{self.name}: Exiting due to KeyboardInterrupt")
             return
 
     def process(self, mol: Molecule):
@@ -331,7 +339,7 @@ def run_parallel_sampling(
 
     df_all: list[pd.DataFrame] = []
     with open(output, "w") as f:
-        for _ in tqdm(range(total)):
+        for _ in tqdm(range(total), desc="Sampling"):
             _, df = pool.fetch()
             if len(df) == 0:
                 continue
@@ -339,7 +347,7 @@ def run_parallel_sampling(
             df_all.append(df)
 
     df_merge = pd.concat(df_all, ignore_index=True)
-    print(
+    logger.info(
         df_merge.loc[df_merge.groupby("target").idxmax()["score"]]
         .select_dtypes(include="number")
         .sum()
@@ -347,7 +355,7 @@ def run_parallel_sampling(
     )
 
     count_success = len(df_merge["target"].unique())
-    print(f"Success rate: {count_success}/{total} = {count_success / total:.3f}")
+    logger.info(f"Success rate: {count_success}/{total} = {count_success / total:.3f}")
 
     recons_targets: set[str] = set()
     for _, row in df_merge.iterrows():
@@ -357,7 +365,9 @@ def run_parallel_sampling(
             if mol_recons.csmiles == mol_target.csmiles:
                 recons_targets.add(row["target"])
     count_recons = len(recons_targets)
-    print(f"Reconstruction rate: {count_recons}/{total} = {count_recons / total:.3f}")
+    logger.info(
+        f"Reconstruction rate: {count_recons}/{total} = {count_recons / total:.3f}"
+    )
 
     pool.end()
 
@@ -375,6 +385,7 @@ def run_parallel_sampling_return_smiles(
     sort_by_scores: bool = True,
 ) -> None:
     num_gpus = num_gpus if num_gpus > 0 else _count_gpus()
+    logger.info(f"Running parallel sampling with {num_gpus} GPUs")
     pool = WorkerPool(
         gpu_ids=list(range(num_gpus)),
         num_workers_per_gpu=num_workers_per_gpu,
@@ -395,7 +406,7 @@ def run_parallel_sampling_return_smiles(
 
     df_all: list[pd.DataFrame] = []
 
-    for _ in tqdm(range(total)):
+    for _ in tqdm(range(total), desc="Sampling"):
         _, df = pool.fetch()
         if len(df) == 0:
             continue
@@ -440,7 +451,7 @@ def run_parallel_sampling_return_smiles_no_early_stop(
 
     df_all: list[pd.DataFrame] = []
 
-    for _ in tqdm(range(total)):
+    for _ in tqdm(range(total), desc="Sampling"):
         _, df = pool.fetch()
         if len(df) == 0:
             continue
@@ -505,11 +516,11 @@ def run_sampling_one_cpu(
         df = sampler.get_dataframe()[:max_results]
 
         # if len(df) == 0:
-        #     print(f"{input.smiles}: No results for {next_task.smiles}")
+        #     logger.infof"{input.smiles}: No results for {next_task.smiles}")
         # else:
         #     max_sim = df["score"].max()
-        #     print(f"{input.smiles}: {max_sim:.3f} {next_task.smiles}")
+        #     logger.info(f"{input.smiles}: {max_sim:.3f} {next_task.smiles}")
     except KeyboardInterrupt:
-        print(f"Exiting due to KeyboardInterrupt")
+        logger.warning("Exiting due to KeyboardInterrupt")
 
     return df

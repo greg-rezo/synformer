@@ -1,3 +1,4 @@
+import logging
 import os
 import random
 from pathlib import Path
@@ -11,11 +12,15 @@ import yaml
 from joblib import delayed
 from rdkit import Chem, rdBase
 from rdkit.Chem.rdchem import Mol
+from tdc.generation import MolGen
+from tdc.metadata import single_molecule_dataset_names
 
 from synformer.chem.mol import Molecule
 from synformer.sampler.analog.parallel import run_parallel_sampling_return_smiles
 
 rdBase.DisableLog("rdApp.error")
+
+logger = logging.getLogger(__name__)
 
 
 def sanitize(mol_list):
@@ -29,7 +34,7 @@ def sanitize(mol_list):
                     smiles_set.add(smiles)
                     new_mol_list.append(mol)
             except ValueError:
-                print("bad smiles")
+                logger.info("bad smiles")
     return new_mol_list
 
 
@@ -60,20 +65,26 @@ def top_auc(buffer, top_n, finish, freq_log, max_oracle_calls):
 
 
 class Oracle:
-    def __init__(self, args=None, mol_buffer={}):
-        self.name = None
-        self.evaluator = None
-        self.task_label = None
+    def __init__(
+        self,
+        args=None,
+        mol_buffer={},
+        max_oracle_calls=10000,
+        freq_log=100,
+        oracle_name="SA",
+        evaluator_name="Diversity",
+    ):
+        self.task_name = f"{oracle_name}_{evaluator_name}"
         if args is None:
-            self.max_oracle_calls = 10000
-            self.freq_log = 100
+            self.max_oracle_calls = max_oracle_calls
+            self.freq_log = freq_log
         else:
             self.args = args
             self.max_oracle_calls = args.max_oracle_calls
             self.freq_log = args.freq_log
         self.mol_buffer = mol_buffer
-        self.sa_scorer = tdc.Oracle(name="SA")
-        self.diversity_evaluator = tdc.Evaluator(name="Diversity")
+        self.oracle = tdc.Oracle(name=oracle_name)
+        self.evaluator = tdc.Evaluator(name=evaluator_name)
         self.last_log = 0
         self.output_dir = "output"
         os.makedirs(self.output_dir, exist_ok=True)
@@ -141,10 +152,10 @@ class Oracle:
         avg_top1 = np.max(scores)
         avg_top10 = np.mean(sorted(scores, reverse=True)[:10])
         avg_top100 = np.mean(scores)
-        avg_sa = np.mean(self.sa_scorer(smis))
-        diversity_top100 = self.diversity_evaluator(smis)
+        avg_sa = np.mean(self.oracle(smis))
+        diversity_top100 = self.evaluator(smis)
 
-        print(
+        logger.info(
             f"{n_calls}/{self.max_oracle_calls} | "
             f"avg_top1: {avg_top1:.3f} | "
             f"avg_top10: {avg_top10:.3f} | "
@@ -154,7 +165,7 @@ class Oracle:
         )
 
         # try:
-        print(
+        logger.info(
             {
                 "avg_top1": avg_top1,
                 "avg_top10": avg_top10,
@@ -220,7 +231,7 @@ class Oracle:
                     self.sort_buffer()
                     self.log_intermediate()
                     self.last_log = len(self.mol_buffer)
-                    self.save_result(self.task_label)
+                    self.save_result(suffix=self.task_name)
         else:
             score_list = self.score_smi(smiles_lst)
             if (
@@ -230,7 +241,7 @@ class Oracle:
                 self.sort_buffer()
                 self.log_intermediate()
                 self.last_log = len(self.mol_buffer)
-                self.save_result(self.task_label)
+                self.save_result(suffix=self.task_name)
         return score_list
 
     @property
@@ -301,35 +312,39 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--oracle", type=str, required=True)
-    parser.add_argument("--name", type=str, required=True)
-    parser.add_argument("--model-path", type=str, required=True)
+    parser.add_argument("--oracle", type=str, default="SA")
+    parser.add_argument("--evaluator", type=str, default="Diversity")
+    parser.add_argument(
+        "--model_path",
+        type=Path,
+        default=Path("data/trained_weights/sf_ed_default.ckpt"),
+    )
+    parser.add_argument("--max_oracle_calls", type=int, default=10000)
+    parser.add_argument("--freq_log", type=int, default=100)
+    parser.add_argument("--population_size", type=int, default=100)
+    parser.add_argument("--offspring_size", type=int, default=100)
+    parser.add_argument("--mutation_rate", type=float, default=0.1)
+    parser.add_argument(
+        "--mol_dataset", type=str, default="zinc", choices=single_molecule_dataset_names
+    )
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    smi_file = None
-    config = {
-        "population_size": 100,
-        "offspring_size": 100,
-        "mutation_rate": 0.1,
-    }
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
 
-    oracle = Oracle()
-
-    from tdc.generation import MolGen
-
-    oracle.assign_evaluator(tdc.Oracle(name=args.oracle))
+    oracle = Oracle(
+        args=args,
+        max_oracle_calls=args.max_oracle_calls,
+        freq_log=args.freq_log,
+        oracle_name=args.oracle,
+        evaluator_name=args.evaluator,
+    )
 
     pool = joblib.Parallel(n_jobs=64)
 
-    data = MolGen(name="ZINC")
+    data = MolGen(name=args.mol_dataset)
     all_smiles = data.get_data().smiles.to_list()
-
-    if smi_file is not None:
-        # Exploitation run
-        starting_population = all_smiles[: config["population_size"]]
-    else:
-        # Exploration run
-        starting_population = np.random.choice(all_smiles, config["population_size"])
+    starting_population = np.random.choice(all_smiles, args.population_size)
 
     # select initial population
     # population_smiles = heapq.nlargest(config["population_size"], starting_population, key=oracle)
@@ -351,11 +366,11 @@ if __name__ == "__main__":
 
         # new_population
         mating_pool = make_mating_pool(
-            population_mol, population_scores, config["population_size"]
+            population_mol, population_scores, args.population_size
         )
         offspring_mol = pool(
-            delayed(reproduce)(mating_pool, config["mutation_rate"])
-            for _ in range(config["offspring_size"])
+            delayed(reproduce)(mating_pool, args.mutation_rate)
+            for _ in range(args.offspring_size)
         )
 
         # add new_population
@@ -374,7 +389,7 @@ if __name__ == "__main__":
         population_scores = oracle([Chem.MolToSmiles(mol) for mol in population_mol])
         population_tuples = list(zip(population_scores, population_mol))
         population_tuples = sorted(population_tuples, key=lambda x: x[0], reverse=True)[
-            : config["population_size"]
+            : args.population_size
         ]
         population_mol = [t[1] for t in population_tuples]
         population_scores = [t[0] for t in population_tuples]
@@ -390,7 +405,7 @@ if __name__ == "__main__":
                 patience += 1
                 if patience >= 5:
                     oracle.log_intermediate(finish=True)
-                    print("convergence criteria met, abort ...... ")
+                    logger.info("convergence criteria met, abort ...... ")
                     break
             else:
                 patience = 0
