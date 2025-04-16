@@ -1,3 +1,23 @@
+# Rezo instructions
+
+## Install
+1. `git clone git@github.com:greg-rezo/synformer.git && cd synformer`
+2. `curl -LsSf https://astral.sh/uv/install.sh | sh`
+3. `uv venv ../.venv/synformer && source ../.venv/synformer/bin/activate`
+4. `uv pip install -r requirements.txt && uv pip install -e .`
+5. `wget https://huggingface.co/whgao/synformer/resolve/main/fpindex.pkl?download=true -O data/processed/comp_2048/fpindex.pkl`
+6. `wget https://huggingface.co/whgao/synformer/resolve/main/matrix.pkl?download=true -O data/processed/comp_2048/matrix.pkl`
+7. `wget https://huggingface.co/whgao/synformer/resolve/main/sf_ed_default.ckpt?download=true -O data/trained_weights/sf_ed_default.ckpt`
+
+Test:
+* python script/sample.py --model-path data/trained_weights/sf_ed_default.ckpt --input data/enamine_smiles_1k.txt --output results/enamine_smiles_1k.csv`
+* PYTHONPATH=$PWD python experiments/graphga_sf_opt.py --oracle QED --name QED --model-path data/trained_weights/sf_ed_default.ckpt 
+
+## Usage
+
+
+
+
 # SynFormer
 
 SynFormer is a generative modeling framework designed to efficiently explore and navigate synthesizable chemical space.

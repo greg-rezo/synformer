@@ -1,9 +1,9 @@
 import pathlib
 
 import click
-from parallel import run_parallel_sampling
 
 from synformer.chem.mol import Molecule, read_mol_file
+from synformer.sampler.analog.parallel import run_parallel_sampling
 
 
 def _input_mols_option(p):
@@ -12,7 +12,12 @@ def _input_mols_option(p):
 
 @click.command()
 @click.option("--input", "-i", type=_input_mols_option, required=True)
-@click.option("--output", "-o", type=click.Path(exists=False, path_type=pathlib.Path), required=True)
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(exists=False, path_type=pathlib.Path),
+    required=True,
+)
 @click.option(
     "--model-path",
     "-m",

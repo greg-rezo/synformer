@@ -58,7 +58,9 @@ class Worker(mp.Process):
         self._model = model
 
         self._fpindex: FingerprintIndex = pickle.load(open(config.chem.fpindex, "rb"))
-        self._rxn_matrix: ReactantReactionMatrix = pickle.load(open(config.chem.rxn_matrix, "rb"))
+        self._rxn_matrix: ReactantReactionMatrix = pickle.load(
+            open(config.chem.rxn_matrix, "rb")
+        )
 
         try:
             while True:
@@ -91,7 +93,9 @@ class Worker(mp.Process):
             sampler.evolve(gpu_lock=self._gpu_lock, show_pbar=False, time_limit=tl)
             max_sim = max(
                 [
-                    p.molecule.sim(mol, FingerprintOption.morgan_for_tanimoto_similarity())
+                    p.molecule.sim(
+                        mol, FingerprintOption.morgan_for_tanimoto_similarity()
+                    )
                     for p in sampler.get_products()
                 ]
                 or [-1]
@@ -192,7 +196,9 @@ class WorkerNoStop(mp.Process):
         self._model = model
 
         self._fpindex: FingerprintIndex = pickle.load(open(config.chem.fpindex, "rb"))
-        self._rxn_matrix: ReactantReactionMatrix = pickle.load(open(config.chem.rxn_matrix, "rb"))
+        self._rxn_matrix: ReactantReactionMatrix = pickle.load(
+            open(config.chem.rxn_matrix, "rb")
+        )
 
         try:
             while True:
@@ -283,7 +289,9 @@ class WorkerPoolNoStop:
 def _count_gpus():
     return int(
         subprocess.check_output(
-            "nvidia-smi --query-gpu=name --format=csv,noheader | wc -l", shell=True, text=True
+            "nvidia-smi --query-gpu=name --format=csv,noheader | wc -l",
+            shell=True,
+            text=True,
         ).strip()
     )
 
@@ -331,7 +339,12 @@ def run_parallel_sampling(
             df_all.append(df)
 
     df_merge = pd.concat(df_all, ignore_index=True)
-    print(df_merge.loc[df_merge.groupby("target").idxmax()["score"]].select_dtypes(include="number").sum() / total)
+    print(
+        df_merge.loc[df_merge.groupby("target").idxmax()["score"]]
+        .select_dtypes(include="number")
+        .sum()
+        / total
+    )
 
     count_success = len(df_merge["target"].unique())
     print(f"Success rate: {count_success}/{total} = {count_success / total:.3f}")
@@ -438,6 +451,7 @@ def run_parallel_sampling_return_smiles_no_early_stop(
 
     return df_merge
 
+
 def run_sampling_one_cpu(
     input: Molecule,
     model_path: pathlib.Path,
@@ -450,7 +464,6 @@ def run_sampling_one_cpu(
     max_evolve_steps: int = 12,
     sort_by_scores: bool = True,
 ) -> pd.DataFrame:
-
     ckpt = torch.load(model_path, map_location="cpu")
     config = OmegaConf.create(ckpt["hyper_parameters"]["config"])
     model = Synformer(config.model)
@@ -458,7 +471,7 @@ def run_sampling_one_cpu(
     model.eval()
     _model = model
 
-    state_pool_opt={
+    state_pool_opt = {
         "factor": search_width,
         "max_active_states": exhaustiveness,
         "sort_by_score": sort_by_scores,
@@ -479,7 +492,9 @@ def run_sampling_one_cpu(
             sampler.evolve(gpu_lock=None, show_pbar=False, time_limit=tl)
             max_sim = max(
                 [
-                    p.molecule.sim(input, FingerprintOption.morgan_for_tanimoto_similarity())
+                    p.molecule.sim(
+                        input, FingerprintOption.morgan_for_tanimoto_similarity()
+                    )
                     for p in sampler.get_products()
                 ]
                 or [-1]
@@ -487,7 +502,7 @@ def run_sampling_one_cpu(
             if max_sim == 1.0:
                 break
 
-        df = sampler.get_dataframe()[: max_results]
+        df = sampler.get_dataframe()[:max_results]
 
         # if len(df) == 0:
         #     print(f"{input.smiles}: No results for {next_task.smiles}")

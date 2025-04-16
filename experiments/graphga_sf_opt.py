@@ -1,5 +1,6 @@
 import os
 import random
+from pathlib import Path
 
 import crossover as co
 import joblib
@@ -36,15 +37,21 @@ def top_auc(buffer, top_n, finish, freq_log, max_oracle_calls):
     sum = 0
     prev = 0
     called = 0
-    ordered_results = list(sorted(buffer.items(), key=lambda kv: kv[1][1], reverse=False))
+    ordered_results = list(
+        sorted(buffer.items(), key=lambda kv: kv[1][1], reverse=False)
+    )
     for idx in range(freq_log, min(len(buffer), max_oracle_calls), freq_log):
         temp_result = ordered_results[:idx]
-        temp_result = list(sorted(temp_result, key=lambda kv: kv[1][0], reverse=True))[:top_n]
+        temp_result = list(sorted(temp_result, key=lambda kv: kv[1][0], reverse=True))[
+            :top_n
+        ]
         top_n_now = np.mean([item[1][0] for item in temp_result])
         sum += freq_log * (top_n_now + prev) / 2
         prev = top_n_now
         called = idx
-    temp_result = list(sorted(ordered_results, key=lambda kv: kv[1][0], reverse=True))[:top_n]
+    temp_result = list(sorted(ordered_results, key=lambda kv: kv[1][0], reverse=True))[
+        :top_n
+    ]
     top_n_now = np.mean([item[1][0] for item in temp_result])
     sum += (len(buffer) - called) * (top_n_now + prev) / 2
     if finish and len(buffer) < max_oracle_calls:
@@ -79,13 +86,17 @@ class Oracle:
         self.evaluator = evaluator
 
     def sort_buffer(self):
-        self.mol_buffer = dict(sorted(self.mol_buffer.items(), key=lambda kv: kv[1][0], reverse=True))
+        self.mol_buffer = dict(
+            sorted(self.mol_buffer.items(), key=lambda kv: kv[1][0], reverse=True)
+        )
 
     def save_result(self, suffix=None):
         if suffix is None:
             output_file_path = os.path.join(self.output_dir, "results.yaml")
         else:
-            output_file_path = os.path.join(self.output_dir, "results_" + suffix + ".yaml")
+            output_file_path = os.path.join(
+                self.output_dir, "results_" + suffix + ".yaml"
+            )
 
         self.sort_buffer()
         with open(output_file_path, "w") as f:
@@ -106,10 +117,16 @@ class Oracle:
                     scores = [item[1][0] for item in temp_top100]
                     n_calls = len(self.mol_buffer)
                 else:
-                    results = list(sorted(self.mol_buffer.items(), key=lambda kv: kv[1][1], reverse=False))[
-                        : self.max_oracle_calls
-                    ]
-                    temp_top100 = sorted(results, key=lambda kv: kv[1][0], reverse=True)[:100]
+                    results = list(
+                        sorted(
+                            self.mol_buffer.items(),
+                            key=lambda kv: kv[1][1],
+                            reverse=False,
+                        )
+                    )[: self.max_oracle_calls]
+                    temp_top100 = sorted(
+                        results, key=lambda kv: kv[1][0], reverse=True
+                    )[:100]
                     smis = [item[0] for item in temp_top100]
                     scores = [item[1][0] for item in temp_top100]
                     n_calls = self.max_oracle_calls
@@ -142,9 +159,15 @@ class Oracle:
                 "avg_top1": avg_top1,
                 "avg_top10": avg_top10,
                 "avg_top100": avg_top100,
-                "auc_top1": top_auc(self.mol_buffer, 1, finish, self.freq_log, self.max_oracle_calls),
-                "auc_top10": top_auc(self.mol_buffer, 10, finish, self.freq_log, self.max_oracle_calls),
-                "auc_top100": top_auc(self.mol_buffer, 100, finish, self.freq_log, self.max_oracle_calls),
+                "auc_top1": top_auc(
+                    self.mol_buffer, 1, finish, self.freq_log, self.max_oracle_calls
+                ),
+                "auc_top10": top_auc(
+                    self.mol_buffer, 10, finish, self.freq_log, self.max_oracle_calls
+                ),
+                "auc_top100": top_auc(
+                    self.mol_buffer, 100, finish, self.freq_log, self.max_oracle_calls
+                ),
                 "avg_sa": avg_sa,
                 "diversity_top100": diversity_top100,
                 "n_oracle": n_calls,
@@ -176,7 +199,10 @@ class Oracle:
             if smi in self.mol_buffer:
                 pass
             else:
-                self.mol_buffer[smi] = [float(self.evaluator(smi)), len(self.mol_buffer) + 1]
+                self.mol_buffer[smi] = [
+                    float(self.evaluator(smi)),
+                    len(self.mol_buffer) + 1,
+                ]
             return self.mol_buffer[smi][0]
 
     def __call__(self, smiles_lst):
@@ -187,14 +213,20 @@ class Oracle:
             score_list = []
             for smi in smiles_lst:
                 score_list.append(self.score_smi(smi))
-                if len(self.mol_buffer) % self.freq_log == 0 and len(self.mol_buffer) > self.last_log:
+                if (
+                    len(self.mol_buffer) % self.freq_log == 0
+                    and len(self.mol_buffer) > self.last_log
+                ):
                     self.sort_buffer()
                     self.log_intermediate()
                     self.last_log = len(self.mol_buffer)
                     self.save_result(self.task_label)
         else:
             score_list = self.score_smi(smiles_lst)
-            if len(self.mol_buffer) % self.freq_log == 0 and len(self.mol_buffer) > self.last_log:
+            if (
+                len(self.mol_buffer) % self.freq_log == 0
+                and len(self.mol_buffer) > self.last_log
+            ):
                 self.sort_buffer()
                 self.log_intermediate()
                 self.last_log = len(self.mol_buffer)
@@ -223,7 +255,9 @@ def make_mating_pool(population_mol: list[Mol], population_scores, offspring_siz
     population_scores = [s + MINIMUM for s in population_scores]
     sum_scores = sum(population_scores)
     population_probs = [p / sum_scores for p in population_scores]
-    mating_pool = np.random.choice(population_mol, p=population_probs, size=offspring_size, replace=True)
+    mating_pool = np.random.choice(
+        population_mol, p=population_probs, size=offspring_size, replace=True
+    )
     return mating_pool
 
 
@@ -245,7 +279,7 @@ def reproduce(mating_pool, mutation_rate):
         return parent_a
 
 
-def projection(smiles_list, model_path="logs/default/epoch=144-step=725000.ckpt"):
+def projection(smiles_list: list[str], model_path: Path):
     input = [Molecule(s) for s in smiles_list]
     result_df = run_parallel_sampling_return_smiles(
         input=input,
@@ -267,8 +301,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--oracle", type=str, default=None)
-    parser.add_argument("--name", type=str, default=None)
+    parser.add_argument("--oracle", type=str, required=True)
+    parser.add_argument("--name", type=str, required=True)
+    parser.add_argument("--model-path", type=str, required=True)
     args = parser.parse_args()
 
     smi_file = None
@@ -299,7 +334,7 @@ if __name__ == "__main__":
     # select initial population
     # population_smiles = heapq.nlargest(config["population_size"], starting_population, key=oracle)
     population_smiles = starting_population
-    population_smiles = projection(population_smiles)
+    population_smiles = projection(population_smiles, model_path=args.model_path)
     population_mol = [Chem.MolFromSmiles(s) for s in population_smiles]
     population_scores = oracle([Chem.MolToSmiles(mol) for mol in population_mol])
 
@@ -308,35 +343,48 @@ if __name__ == "__main__":
     while True:
         if len(oracle) > 100:
             oracle.sort_buffer()
-            old_score = np.mean([item[1][0] for item in list(oracle.mol_buffer.items())[:100]])
+            old_score = np.mean(
+                [item[1][0] for item in list(oracle.mol_buffer.items())[:100]]
+            )
         else:
             old_score = 0
 
         # new_population
-        mating_pool = make_mating_pool(population_mol, population_scores, config["population_size"])
+        mating_pool = make_mating_pool(
+            population_mol, population_scores, config["population_size"]
+        )
         offspring_mol = pool(
-            delayed(reproduce)(mating_pool, config["mutation_rate"]) for _ in range(config["offspring_size"])
+            delayed(reproduce)(mating_pool, config["mutation_rate"])
+            for _ in range(config["offspring_size"])
         )
 
         # add new_population
         population_mol += offspring_mol
         population_mol = sanitize(population_mol)
         population_mol = [
-            Chem.MolFromSmiles(smi) for smi in projection([Chem.MolToSmiles(mol) for mol in population_mol])
+            Chem.MolFromSmiles(smi)
+            for smi in projection(
+                [Chem.MolToSmiles(mol) for mol in population_mol],
+                model_path=args.model_path,
+            )
         ]
 
         # stats
         old_scores = population_scores
         population_scores = oracle([Chem.MolToSmiles(mol) for mol in population_mol])
         population_tuples = list(zip(population_scores, population_mol))
-        population_tuples = sorted(population_tuples, key=lambda x: x[0], reverse=True)[: config["population_size"]]
+        population_tuples = sorted(population_tuples, key=lambda x: x[0], reverse=True)[
+            : config["population_size"]
+        ]
         population_mol = [t[1] for t in population_tuples]
         population_scores = [t[0] for t in population_tuples]
 
         ### early stopping
         if len(oracle) > 100:
             oracle.sort_buffer()
-            new_score = np.mean([item[1][0] for item in list(oracle.mol_buffer.items())[:100]])
+            new_score = np.mean(
+                [item[1][0] for item in list(oracle.mol_buffer.items())[:100]]
+            )
             # import ipdb; ipdb.set_trace()
             if (new_score - old_score) < 1e-3:
                 patience += 1
