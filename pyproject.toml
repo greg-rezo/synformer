@@ -1,6 +1,7 @@
 [project]
 name = "synformer"
-license = {file = "LICENSE"}
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
     {name = "Wenhao Gao", email = "gaowh19@gmail.com"},
     {name = "Shitong Luo", email = "luost26@gmail.com"},
@@ -10,6 +11,17 @@ description = "SynFormer: Generative Model for Synthesizable Molecule Generation
 readme = "README.md"
 requires-python = ">=3.10"
 dynamic = ["version", "dependencies"]
+
+
+# download assets on installation
+#[build-system]
+#requires = [
+#  "setuptools>=61.0",
+#  "wheel",
+#  "requests"
+#]
+#build-backend = "download_artifacts"
+#backend-path = ["."]
 
 [tool.setuptools]
 packages = ["synformer"]

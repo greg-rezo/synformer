@@ -24,3 +24,10 @@ ipywidgets
 click
 
 pytdc
+
+# new
+ray
+fastapi
+openbabel-wheel
+uvicorn
+pdbfixer @ git+https://github.com/openmm/pdbfixer.git

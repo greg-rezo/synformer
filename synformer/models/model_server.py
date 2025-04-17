@@ -1,180 +1,155 @@
 import logging
 import multiprocessing as mp
-import os
 import pickle
-import signal
-import socket
-import struct
-import time
-from concurrent.futures import ProcessPoolExecutor
-from functools import partial
+from multiprocessing.context import SpawnProcess
 from pathlib import Path
-from typing import Any
 
-import pandas as pd
+import requests
 import torch
+import uvicorn
+from cloudpathlib import GSPath
+from fastapi import FastAPI, Request, Response
 from omegaconf import OmegaConf
 
 from synformer.chem.fpindex import FingerprintIndex
 from synformer.chem.matrix import ReactantReactionMatrix
 from synformer.models.synformer import Synformer
 
-SERVER_PORT = 8766
+GS_ROOT_DIR = GSPath("gs://rezo-artifacts/synformer/data")
+GS_MATRIX_PKL_FILE = GS_ROOT_DIR / "matrix.pkl"
+GS_FPINDEX_PKL_FILE = GS_ROOT_DIR / "fpindex.pkl"
+GS_MODEL_FILE = GS_ROOT_DIR / "trained_weights/sf_ed_default.ckpt"
+
 logger = logging.getLogger(__name__)
 
+app = FastAPI(title="Synformer REST Server")
 
-class SynformerClient:
-    def __init__(
-        self,
-        fpindex: FingerprintIndex,
-        rxn_matrix: ReactantReactionMatrix,
-        host: str = "localhost",
-        port: int = SERVER_PORT,
-    ):
-        self.host = host
-        self.port = port
-        self.fpindex = fpindex
-        self.rxn_matrix = rxn_matrix
-
-    def predict(self, input_dict: dict[str, Any], encode: bool = False):
-        """Send prediction request to socket server"""
-        # Create socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((self.host, self.port))
-
-        try:
-            # Serialize request
-            input_dict["encode"] = encode
-            data = pickle.dumps(input_dict)
-
-            # Send data length and data
-            logger.debug(f"Client sending data length: {len(data)}")
-            sock.sendall(struct.pack(">I", len(data)))
-            sock.sendall(data)
-
-            # Get response length and data
-            msg_len_bytes = sock.recv(4)
-            logger.debug(f"Client received message: {msg_len_bytes}")
-            msg_len = struct.unpack(">I", msg_len_bytes)[0]
-            logger.debug(f"Client received message length: {msg_len}")
-            data = b""
-            while len(data) < msg_len:
-                packet = sock.recv(min(msg_len - len(data), 4096))
-                if not packet:
-                    break
-                data += packet
-
-            return pickle.loads(data)
-        finally:
-            sock.close()
+# Global server state
+server_state = {}
 
 
-class SynformerServer:
-    def __init__(
-        self,
-        fpindex_path: Path,
-        rxn_matrix_path: Path,
-        model_path: Path,
-        host: str = "localhost",
-        port: int = SERVER_PORT,
-        device: torch.device = torch.device("cuda"),
-    ):
-        self.host = host
-        self.port = port
-        self.server = None
-        self.fpindex = pickle.load(open(fpindex_path, "rb"))
-        self.rxn_matrix = pickle.load(open(rxn_matrix_path, "rb"))
+@app.post("/predict")
+async def predict(request: Request):
+    """
+    REST endpoint that accepts a pickled request and returns a pickled response.
+    The request should be a pickled dict containing model inputs and a boolean "encode" flag.
+    """
+    data = await request.body()
+    try:
+        req = pickle.loads(data)
+    except Exception as e:
+        logger.error("Error unpickling request", exc_info=e)
+        return Response(
+            content=b"", media_type="application/octet-stream", status_code=400
+        )
+    encode = req.pop("encode", False)
 
-        ckpt = torch.load(model_path, map_location="cpu")
-        config = OmegaConf.create(ckpt["hyper_parameters"]["config"])
-        self.model = Synformer(config.model).to(device)
-        self.model.load_state_dict({k[6:]: v for k, v in ckpt["state_dict"].items()})
+    model = server_state.get("model")
+    device = server_state.get("device")
+    if model is None or device is None:
+        logger.error("Server state not initialized")
+        return Response(
+            content=b"", media_type="application/octet-stream", status_code=500
+        )
 
-        self.device = device
-
-    def start(self):
-        """Start the socket server in a new process"""
-        mp_context = mp.get_context("spawn")
-        self.server_process = mp_context.Process(target=self._run_server)
-        self.server_process.start()
-        # Wait briefly to ensure server is running
-        time.sleep(1)
-
-    def _run_server(self):
-        """Load model and serve predictions via socket"""
-        logging.basicConfig(level=logging.INFO)
-        logger.debug(f"Server starting on {self.host}:{self.port}")
-
-        # Create socket server
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server.bind((self.host, self.port))
-        self.server.listen(10)
-
-        while True:
-            conn, addr = self.server.accept()
-            try:
-                # Get message length (4 bytes)
-                msg_len_bytes = conn.recv(4)
-                logger.debug(f"Server received message: {msg_len_bytes}")
-                if not msg_len_bytes:
-                    continue
-                msg_len = struct.unpack(">I", msg_len_bytes)[0]
-                logger.debug(f"Server received message length: {msg_len}")
-
-                # Receive, process, and send response
-                data = self._receive_msg(conn, msg_len)
-                if data:
-                    result = self._process_msg(data)
-                    self._send_result(conn, result)
-            finally:
-                conn.close()
-
-    def _receive_msg(self, conn, msg_len):
-        """Receive a message of specified length from the connection."""
-        data = b""
-        while len(data) < msg_len:
-            packet = conn.recv(min(msg_len - len(data), 4096))
-            if not packet:
-                break
-            data += packet
-
-        return data if len(data) == msg_len else None
-
-    def _process_msg(self, data):
-        """Process the received message and return the result."""
-        # Unpack request
-        request = pickle.loads(data)
-        encode = request.pop("encode")
-
-        # Move tensors to device
-        item_dict = {
-            k: v.to(self.device)
-            for k, v in request.items()
-            if isinstance(v, torch.Tensor)
-        }
-
-        # Process based on request type
-        t = time.perf_counter()
-        if encode:
-            result = self.model.encode(item_dict)  # type: ignore
-            logger.debug(f"Encoded in {time.perf_counter() - t:.2f} seconds")
+    # If needed, convert parts of req to torch tensors here.
+    # This example assumes that req (a dict) is already in the appropriate structure.
+    input_dict = {}
+    for k, v in req.items():
+        if isinstance(v, torch.Tensor):
+            input_dict[k] = v.to(device)
         else:
-            result = self.model.predict(
-                **item_dict,  # type: ignore
-                fpindex=self.fpindex,
-                rxn_matrix=self.rxn_matrix,
-            )
-            logger.debug(f"Predicted in {time.perf_counter() - t:.2f} seconds")
+            input_dict[k] = v
+    if encode:
+        result = model.encode(input_dict)
+        result.code = result.code.cpu()
+        result.code_padding_mask = result.code_padding_mask.cpu()
+        for k, v in result.loss_dict.items():
+            result.loss_dict[k] = v.cpu()
+    else:
+        result = model.predict(
+            **input_dict,
+            fpindex=server_state["fpindex"],
+            rxn_matrix=server_state["rxn_matrix"],
+        )
+        result.token_logits = result.token_logits.cpu()
+        result.token_sampled = result.token_sampled.cpu()
+        result.reaction_logits = result.reaction_logits.cpu()
 
-        return result
+    result_data = pickle.dumps(result)
+    return Response(content=result_data, media_type="application/octet-stream")
 
-    def _send_result(self, conn, result):
-        """Send the result back to the client."""
-        result_data = pickle.dumps(result)
-        logger.debug(f"Server sending data length: {len(result_data)}")
-        conn.sendall(struct.pack(">I", len(result_data)))
-        conn.sendall(result_data)
 
-    def get_client(self):
-        return SynformerClient(self.fpindex, self.rxn_matrix, self.host, self.port)
+def _start_server(
+    model: Synformer,
+    fpindex: FingerprintIndex,
+    rxn_matrix: ReactantReactionMatrix,
+    host: str = "0.0.0.0",
+    port: int = 8000,
+    device: torch.device = torch.device("cuda"),
+):
+    logging.basicConfig(level=logging.DEBUG)
+
+    model = model.to(device)
+    model.eval()
+    server_state["model"] = model
+    server_state["fpindex"] = fpindex
+    server_state["rxn_matrix"] = rxn_matrix
+    server_state["device"] = device
+
+    logger.info(f"Starting server on {host}:{port}")
+    uvicorn.run(app, host=host, port=port, log_level=logging.WARNING)
+
+
+def download_artifacts(out_dir: Path) -> dict[str, Path]:
+    """Downloads the artifacts from GCS to local disk."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name_to_gs_file = {
+        "matrix": GS_MATRIX_PKL_FILE,
+        "fpindex": GS_FPINDEX_PKL_FILE,
+        "model": GS_MODEL_FILE,
+    }
+    name_to_local_file = {}
+    for name, gs_file in name_to_gs_file.items():
+        relative_path = gs_file.relative_to(GS_ROOT_DIR)
+        local_path = out_dir / relative_path
+        if not local_path.exists():
+            gs_file.download_to(local_path)
+        name_to_local_file[name] = local_path
+    return name_to_local_file
+
+
+def load_artifacts(
+    out_dir: Path,
+) -> tuple[FingerprintIndex, ReactantReactionMatrix, Synformer]:
+    """Loads the artifacts from GCS into memory."""
+    name_to_local_file = download_artifacts(out_dir)
+    fpindex = pickle.load(open(name_to_local_file["fpindex"], "rb"))
+    rxn_matrix = pickle.load(open(name_to_local_file["matrix"], "rb"))
+
+    ckpt = torch.load(name_to_local_file["model"], map_location="cpu")
+    config = OmegaConf.create(ckpt["hyper_parameters"]["config"])
+    model = Synformer(config.model)
+    model.load_state_dict({k[6:]: v for k, v in ckpt["state_dict"].items()})
+
+    return fpindex, rxn_matrix, model
+
+
+def launch_server_process(
+    out_dir: Path = Path("."),
+    host: str = "0.0.0.0",
+    port: int = 8000,
+    device: torch.device = torch.device("cuda"),
+) -> tuple[SpawnProcess, FingerprintIndex, ReactantReactionMatrix]:
+    name_to_local_file = download_artifacts(out_dir)
+    model_file = name_to_local_file["model"]
+    fpindex = pickle.load(open(name_to_local_file["fpindex"], "rb"))
+    rxn_matrix = pickle.load(open(name_to_local_file["matrix"], "rb"))
+
+    mp_context = mp.get_context("spawn")
+    p = mp_context.Process(
+        target=_start_server,
+        args=(model_file, fpindex, rxn_matrix, host, port, device),
+    )
+    p.start()
+    return p, fpindex, rxn_matrix

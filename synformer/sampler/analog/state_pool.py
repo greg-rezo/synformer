@@ -5,13 +5,13 @@ import logging
 import time
 from collections.abc import Iterable
 from functools import cached_property
-from multiprocessing.synchronize import Lock
 
 import pandas as pd
 import torch
 from tqdm.auto import tqdm
 
 from synformer.chem.fpindex import FingerprintIndex
+from synformer.chem.matrix import ReactantReactionMatrix
 from synformer.chem.mol import FingerprintOption, Molecule
 from synformer.chem.stack import Stack
 from synformer.data.collate import (
@@ -21,7 +21,7 @@ from synformer.data.collate import (
     collate_tokens,
 )
 from synformer.data.common import TokenType, featurize_stack
-from synformer.models.model_server import SynformerClient
+from synformer.models.model_server_client import SynformerClient
 
 logger = logging.getLogger(__name__)
 
@@ -66,11 +66,15 @@ class StatePool:
         self,
         mol: Molecule,
         model_client: SynformerClient,
+        fpindex: FingerprintIndex,
+        rxn_matrix: ReactantReactionMatrix,
         factor: int = 16,
         max_active_states: int = 256,
         sort_by_score: bool = True,
     ) -> None:
         self._model_client = model_client
+        self._fpindex = fpindex
+        self._rxn_matrix = rxn_matrix
         self._mol = mol
         atoms, bonds = mol.featurize_simple()
         self._atoms = atoms[None]
@@ -132,7 +136,7 @@ class StatePool:
             featurize_stack(
                 state.stack,
                 end_token=False,
-                fpindex=self._model_client.fpindex,
+                fpindex=self._fpindex,
             )
             for state in self._active
         ]
@@ -167,9 +171,7 @@ class StatePool:
 
         best_token = result.best_token()
         top_reactants = result.top_reactants(topk=m)
-        top_reactions = result.top_reactions(
-            topk=m, rxn_matrix=self._model_client.rxn_matrix
-        )
+        top_reactions = result.top_reactions(topk=m, rxn_matrix=self._rxn_matrix)
 
         next: list[State] = []
         for i, j in nm_iter:

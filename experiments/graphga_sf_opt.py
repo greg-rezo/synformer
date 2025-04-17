@@ -1,27 +1,31 @@
+import argparse
 import logging
-import os
+import multiprocessing as mp
 import random
 import time
+import warnings
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import cast
 
 import crossover as co
-import joblib
 import mutate as mu
 import numpy as np
 import tdc
 import yaml
-from joblib import delayed
 from pydantic import BaseModel
 from rdkit import Chem, rdBase
 from rdkit.Chem.rdchem import Mol
 from tdc.generation import MolGen
 from tdc.metadata import single_molecule_dataset_names
 
+from synformer.chem.fpindex import FingerprintIndex
+from synformer.chem.matrix import ReactantReactionMatrix
 from synformer.chem.mol import Molecule
-from synformer.models.model_server import SynformerClient, SynformerServer
+from synformer.models.model_server import launch_server_process
+from synformer.models.model_server_client import SynformerClient
 from synformer.sampler.analog.parallel import run_sampling
 
+GLOBAL_POOL = ProcessPoolExecutor(mp_context=mp.get_context("spawn"))
 rdBase.DisableLog("rdApp.error")
 
 logger = logging.getLogger(__name__)
@@ -54,72 +58,38 @@ class ScoredMol(BaseModel):
         return self.smiles == other.smiles
 
 
-# TODO: parallelize
+def _sanitize_mol(mol: ScoredMol) -> ScoredMol | None:
+    try:
+        smiles = Chem.MolToSmiles(mol.mol)
+        return ScoredMol(smiles=smiles)
+    except ValueError as e:
+        logger.info(f"Bad smiles: {e}")
+        return None
+
+
 def sanitize_mols(mols: list[ScoredMol]) -> list[ScoredMol]:
-    mols_set = set()
-    for mol in mols:
-        if mol.mol is not None:
-            try:
-                smiles = Chem.MolToSmiles(mol.mol)
-                new_mol = ScoredMol(smiles=smiles)
-                if smiles is not None and new_mol not in mols_set:
-                    mols_set.add(new_mol)
-            except ValueError as e:
-                logger.info(f"Bad smiles: {e}")
-    return list(mols_set)
-
-
-def top_auc(buffer, top_n, finish, freq_log, max_oracle_calls):
-    sum = 0
-    prev = 0
-    called = 0
-    ordered_results = list(
-        sorted(buffer.items(), key=lambda kv: kv[1][1], reverse=False)
-    )
-    for idx in range(freq_log, min(len(buffer), max_oracle_calls), freq_log):
-        temp_result = ordered_results[:idx]
-        temp_result = list(sorted(temp_result, key=lambda kv: kv[1][0], reverse=True))[
-            :top_n
-        ]
-        top_n_now = np.mean([item[1][0] for item in temp_result])
-        sum += freq_log * (top_n_now + prev) / 2
-        prev = top_n_now
-        called = idx
-    temp_result = list(sorted(ordered_results, key=lambda kv: kv[1][0], reverse=True))[
-        :top_n
-    ]
-    top_n_now = np.mean([item[1][0] for item in temp_result])
-    sum += (len(buffer) - called) * (top_n_now + prev) / 2
-    if finish and len(buffer) < max_oracle_calls:
-        sum += (max_oracle_calls - len(buffer)) * top_n_now
-    return sum / max_oracle_calls
+    results = list(GLOBAL_POOL.map(_sanitize_mol, mols))
+    return [mol for mol in results if mol is not None]
 
 
 class Oracle:
-    def __init__(
-        self,
-        max_oracle_calls: int = 10000,
-        freq_log: int = 100,
-        oracle_name: str = "DRD2",
-    ):
+    def __init__(self, max_oracle_calls: int = 10000, oracle_name: str = "DRD2"):
         self.oracle_name = oracle_name
         self.max_oracle_calls = max_oracle_calls
-        self.freq_log = freq_log
         self.mol_buffer: set[ScoredMol] = set()
         self.oracle = tdc.Oracle(name=oracle_name)
         self.sa_scorer = tdc.Oracle(name="SA")
         self.diversity_evaluator = tdc.Evaluator(name="Diversity")
-        self.last_log = 0
-        self.output_dir = "output"
-        os.makedirs(self.output_dir, exist_ok=True)
+        self.output_dir = Path("output")
+        self.log_freq = 10
 
-    def save_result(self, suffix=None):
-        output_file_path = os.path.join(
-            self.output_dir, f"results_{self.oracle_name}.yaml"
-        )
+    def _save_result(self):
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        output_file_path = self.output_dir / f"results_{self.oracle_name}.yaml"
 
+        mol_data = [mol.model_dump() for mol in self.mol_buffer]
         with open(output_file_path, "w") as f:
-            yaml.dump(self.mol_buffer, f, sort_keys=False)
+            yaml.dump(mol_data, f, sort_keys=False)
 
     def get_avg_scores(self, top_n: list[int]) -> list[float]:
         mols = sorted(list(self.mol_buffer), reverse=True)
@@ -134,7 +104,7 @@ class Oracle:
         mols = sorted(list(self.mol_buffer), reverse=True)
         return [mol.smiles for mol in mols[:top_n]]
 
-    def log_intermediate(self):
+    def _log(self):
         smis = self.get_top_smiles(top_n=100)
         n_calls = len(self.mol_buffer)
 
@@ -187,9 +157,9 @@ class Oracle:
                 break
 
             self._score_mol(mol)
-            if len(self.mol_buffer) % self.freq_log == 0:
-                self.log_intermediate()
-                self.save_result()
+            if len(self.mol_buffer) % self.log_freq == 0:
+                self._log()
+                self._save_result()
 
     @property
     def finished(self):
@@ -239,43 +209,44 @@ def reproduce(mating_pool_mols: list[ScoredMol], mutation_rate: float) -> Scored
 
 
 def project_to_closest_synthesizable_mols(
-    mols: list[ScoredMol], model_client: SynformerClient
+    mols: list[ScoredMol],
+    fpindex: FingerprintIndex,
+    rxn_matrix: ReactantReactionMatrix,
+    model_client: SynformerClient,
 ) -> list[ScoredMol]:
     t = time.perf_counter()
     molecules = [Molecule(mol.smiles) for mol in mols]
     result_df = run_sampling(
+        fpindex=fpindex,
+        rxn_matrix=rxn_matrix,
+        model_client=model_client,
         mols=molecules,
         search_width=24,
         exhaustiveness=64,
         time_limit=180,
         sort_by_scores=True,
-        model_client=model_client,
+        max_results=100,
     )
-    result_df.drop_duplicates(subset="target", inplace=True, keep="first")
+    result_df = result_df.sort_values(by="score", ascending=False)
+    result_df = result_df.drop_duplicates(subset="target", keep="first")
     out_smiles_list = result_df.smiles.to_list()
 
     logger.info(
-        f"Projection returned {len(out_smiles_list)} in "
+        f"Projection returned {len(out_smiles_list)} smiles in "
         f"{time.perf_counter() - t:.2f} seconds"
     )
     return [ScoredMol(smiles=smi, score=None) for smi in out_smiles_list]
 
 
 if __name__ == "__main__":
-    import argparse
+    warnings.filterwarnings("ignore")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--oracle", type=str, default="SA")
     parser.add_argument("--evaluator", type=str, default="Diversity")
-    parser.add_argument(
-        "--model_path",
-        type=Path,
-        default=Path("data/trained_weights/sf_ed_default.ckpt"),
-    )
     parser.add_argument("--max_oracle_calls", type=int, default=10000)
-    parser.add_argument("--freq_log", type=int, default=10)
-    parser.add_argument("--population_size", type=int, default=10)
-    parser.add_argument("--offspring_size", type=int, default=10)
+    parser.add_argument("--population_size", type=int, default=100)
+    parser.add_argument("--offspring_size", type=int, default=100)
     parser.add_argument("--mutation_rate", type=float, default=0.1)
     parser.add_argument(
         "--mol_dataset", type=str, default="zinc", choices=single_molecule_dataset_names
@@ -284,22 +255,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
-    matrix_path = args.model_path.parent.parent / "matrix.pkl"
-    fpindex_path = args.model_path.parent.parent / "fpindex.pkl"
-
-    model_server = SynformerServer(
-        model_path=args.model_path,
-        fpindex_path=fpindex_path,
-        rxn_matrix_path=matrix_path,
+    _, fpindex, rxn_matrix = launch_server_process(
         device="cuda",  # type: ignore
+        host="localhost",
+        port=8000,
     )
-    model_server.start()
+    model_client = SynformerClient(host="localhost", port=8000)
 
-    oracle = Oracle(
-        max_oracle_calls=args.max_oracle_calls,
-        freq_log=args.freq_log,
-        oracle_name=args.oracle,
-    )
+    oracle = Oracle(max_oracle_calls=args.max_oracle_calls, oracle_name=args.oracle)
 
     logger.info("Loading dataset")
     data = MolGen(name=args.mol_dataset)
@@ -312,18 +275,28 @@ if __name__ == "__main__":
         ScoredMol(smiles=smi, score=None) for smi in population_smiles_list
     ]
     population_mols = project_to_closest_synthesizable_mols(
-        population_mols, model_client=model_server.get_client()
+        population_mols,
+        fpindex=fpindex,
+        rxn_matrix=rxn_matrix,
+        model_client=model_client,
     )
 
     logger.info("Scoring initial population")
-    # TODO: parallelize
     oracle(population_mols)
 
+    prev_avg_score = None
     while True:
         if len(oracle) > 100:
-            prev_score = oracle.get_avg_scores(top_n=[100])[0]
-        else:
-            prev_score = 0
+            new_avg_score = oracle.get_avg_scores(top_n=[100])[0]
+
+            if prev_avg_score is not None and (new_avg_score - prev_avg_score) < 1e-3:
+                logger.info("Convergence criteria met, exiting")
+                break
+            prev_avg_score = new_avg_score
+
+            if oracle.finished:
+                logger.info("Used all oracle calls, existing")
+                break
 
         # new_population
         logger.info("Making mating pool")
@@ -339,33 +312,13 @@ if __name__ == "__main__":
         offspring_mols = sanitize_mols(offspring_mols)
         offspring_mols = project_to_closest_synthesizable_mols(
             offspring_mols,
-            model_client=model_server.get_client(),
+            fpindex=fpindex,
+            rxn_matrix=rxn_matrix,
+            model_client=model_client,
         )
 
         # stats
         logger.info("Scoring offspring")
         oracle(offspring_mols)
 
-        # ### early stopping
-        # logger.info("Checking for convergence")
-        # if len(oracle) > 100:
-        #     new_score = np.mean(
-        #         [item[1][0] for item in list(oracle.mol_buffer.items())[:100]]
-        #     )
-        #     # import ipdb; ipdb.set_trace()
-        #     if (new_score - prev_score) < 1e-3:
-        #         patience += 1
-        #         if patience >= 5:
-        #             oracle.log_intermediate(finish=True)
-        #             logger.info("convergence criteria met, abort ...... ")
-        #             break
-        #     else:
-        #         patience = 0
-
-        #     prev_score = new_score
-
-        if oracle.finished:
-            logger.info("Finished")
-            break
-
-        oracle.save_result()
+        oracle._save_result()

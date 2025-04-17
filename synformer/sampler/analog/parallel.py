@@ -1,3 +1,4 @@
+import io
 import logging
 import multiprocessing as mp
 import os
@@ -5,12 +6,14 @@ import pathlib
 import pickle
 import subprocess
 import time
+import warnings
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from multiprocessing import synchronize as sync
 from typing import TypeAlias
 
 import pandas as pd
+import ray
 import torch
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
@@ -18,7 +21,7 @@ from tqdm.auto import tqdm
 from synformer.chem.fpindex import FingerprintIndex
 from synformer.chem.matrix import ReactantReactionMatrix
 from synformer.chem.mol import FingerprintOption, Molecule
-from synformer.models.model_server import SynformerClient
+from synformer.models.model_server_client import SynformerClient
 from synformer.models.synformer import Synformer
 from synformer.sampler.analog.state_pool import StatePool, TimeLimit
 
@@ -456,17 +459,30 @@ def run_parallel_sampling_return_smiles_no_early_stop(
     return df_merge  # type: ignore
 
 
+@ray.remote
 def _run_sampling_molecule(
     mol: Molecule,
     state_pool_opt: dict,
     time_limit: int,
     max_evolve_steps: int,
     max_results: int,
+    fpindex: FingerprintIndex,
+    rxn_matrix: ReactantReactionMatrix,
     model_client: SynformerClient,
-) -> pd.DataFrame:
+) -> bytes:
+    logging.basicConfig(level=logging.INFO)
+    warnings.filterwarnings("ignore")
+
     try:
-        logging.info(f"Sampling analogs for {mol.smiles}")
-        sampler = StatePool(mol=mol, **state_pool_opt, model_client=model_client)
+        # logger.info(f"Sampling {mol.smiles} on process {os.getpid()}")
+        t = time.perf_counter()
+        sampler = StatePool(
+            mol=mol,
+            **state_pool_opt,
+            model_client=model_client,
+            fpindex=fpindex,
+            rxn_matrix=rxn_matrix,
+        )
         tl = TimeLimit(time_limit)
         for _ in range(max_evolve_steps):
             sampler.evolve(show_pbar=False, time_limit=tl)
@@ -482,15 +498,27 @@ def _run_sampling_molecule(
             if max_sim == 1.0:
                 break
 
-        df = sampler.get_dataframe()[:max_results]
-        logging.info(f"Sampled {len(df)} analogs for {mol.smiles}")
-        return df
+        df = sampler.get_dataframe().drop_duplicates(subset="smiles")
+        df = df.sort_values(by="score", ascending=False)
+        df = df.iloc[:max_results]
+        # logger.info(
+        #     f"Sampled {len(df)} analogs for {mol.smiles} in {time.perf_counter() - t:.2f}s on process {os.getpid()}"
+        # )
+        return df.to_parquet()
     except KeyboardInterrupt:
-        return pd.DataFrame()
+        return pd.DataFrame().to_parquet()
+
+
+def to_iterator(obj_ids):
+    while obj_ids:
+        done, obj_ids = ray.wait(obj_ids)
+        yield ray.get(done[0])
 
 
 def run_sampling(
     mols: list[Molecule],
+    fpindex: FingerprintIndex,
+    rxn_matrix: ReactantReactionMatrix,
     model_client: SynformerClient,
     search_width: int = 24,
     exhaustiveness: int = 64,
@@ -499,7 +527,7 @@ def run_sampling(
     max_evolve_steps: int = 12,
     sort_by_scores: bool = True,
 ) -> pd.DataFrame:
-    logger.info(f"Running sampling for {len(mols)} molecules")
+    # logger.info(f"Running sampling for {len(mols)} molecules")
 
     state_pool_opt = {
         "factor": search_width,
@@ -507,15 +535,34 @@ def run_sampling(
         "sort_by_score": sort_by_scores,
     }
 
-    with ProcessPoolExecutor(mp_context=mp.get_context("spawn"), max_workers=8) as pool:
-        func = partial(
-            _run_sampling_molecule,
-            state_pool_opt=state_pool_opt,
-            time_limit=time_limit,
-            max_evolve_steps=max_evolve_steps,
-            max_results=max_results,
-            model_client=model_client,
+    # Initialize Ray if not already initialized
+    if not ray.is_initialized():
+        ray.init()
+
+    # Put shared objects into Ray's object store
+    fpindex_ref = ray.put(fpindex)
+    rxn_matrix_ref = ray.put(rxn_matrix)
+    model_client_ref = ray.put(model_client)
+
+    # Launch remote tasks for each molecule using the Ray remote function
+    futures = [
+        _run_sampling_molecule.remote(
+            mol,
+            state_pool_opt,
+            time_limit,
+            max_evolve_steps,
+            max_results,
+            fpindex_ref,
+            rxn_matrix_ref,
+            model_client_ref,
         )
-        # dfs = list(pool.map(func, mols))
-        dfs = [func(mol) for mol in mols]
+        for mol in mols
+    ]
+
+    # Retrieve results from Ray
+    bytes_list = tqdm(
+        to_iterator(futures), desc="Retrieving results", total=len(futures)
+    )
+
+    dfs = [pd.read_parquet(io.BytesIO(b)) for b in bytes_list]
     return pd.concat(dfs, ignore_index=True)
