@@ -102,7 +102,7 @@ class SynformerServer:
 
     def _run_server(self):
         """Load model and serve predictions via socket"""
-        logging.basicConfig(level=logging.DEBUG)
+        logging.basicConfig(level=logging.INFO)
         logger.debug(f"Server starting on {self.host}:{self.port}")
 
         # Create socket server
@@ -122,39 +122,59 @@ class SynformerServer:
                 msg_len = struct.unpack(">I", msg_len_bytes)[0]
                 logger.debug(f"Server received message length: {msg_len}")
 
-                # Receive the data
-                data = b""
-                while len(data) < msg_len:
-                    packet = conn.recv(min(msg_len - len(data), 4096))
-                    if not packet:
-                        break
-                    data += packet
-
-                if len(data) == msg_len:
-                    # Process request
-                    request = pickle.loads(data)
-                    encode = request.pop("encode")
-                    item_dict = {
-                        k: v.to(self.device)
-                        for k, v in request.items()
-                        if isinstance(v, torch.Tensor)
-                    }
-                    if encode:
-                        result = self.model.encode(item_dict)  # type: ignore
-                    else:
-                        result = self.model.predict(
-                            **item_dict,  # type: ignore
-                            fpindex=self.fpindex,
-                            rxn_matrix=self.rxn_matrix,
-                        )
-
-                    # Send response
-                    result_data = pickle.dumps(result)
-                    logger.debug(f"Server sending data length: {len(result_data)}")
-                    conn.sendall(struct.pack(">I", len(result_data)))
-                    conn.sendall(result_data)
+                # Receive, process, and send response
+                data = self._receive_msg(conn, msg_len)
+                if data:
+                    result = self._process_msg(data)
+                    self._send_result(conn, result)
             finally:
                 conn.close()
+
+    def _receive_msg(self, conn, msg_len):
+        """Receive a message of specified length from the connection."""
+        data = b""
+        while len(data) < msg_len:
+            packet = conn.recv(min(msg_len - len(data), 4096))
+            if not packet:
+                break
+            data += packet
+
+        return data if len(data) == msg_len else None
+
+    def _process_msg(self, data):
+        """Process the received message and return the result."""
+        # Unpack request
+        request = pickle.loads(data)
+        encode = request.pop("encode")
+
+        # Move tensors to device
+        item_dict = {
+            k: v.to(self.device)
+            for k, v in request.items()
+            if isinstance(v, torch.Tensor)
+        }
+
+        # Process based on request type
+        t = time.perf_counter()
+        if encode:
+            result = self.model.encode(item_dict)  # type: ignore
+            logger.debug(f"Encoded in {time.perf_counter() - t:.2f} seconds")
+        else:
+            result = self.model.predict(
+                **item_dict,  # type: ignore
+                fpindex=self.fpindex,
+                rxn_matrix=self.rxn_matrix,
+            )
+            logger.debug(f"Predicted in {time.perf_counter() - t:.2f} seconds")
+
+        return result
+
+    def _send_result(self, conn, result):
+        """Send the result back to the client."""
+        result_data = pickle.dumps(result)
+        logger.debug(f"Server sending data length: {len(result_data)}")
+        conn.sendall(struct.pack(">I", len(result_data)))
+        conn.sendall(result_data)
 
     def get_client(self):
         return SynformerClient(self.fpindex, self.rxn_matrix, self.host, self.port)

@@ -464,9 +464,8 @@ def _run_sampling_molecule(
     max_results: int,
     model_client: SynformerClient,
 ) -> pd.DataFrame:
-    logging.basicConfig(level=logging.DEBUG)
     try:
-        logging.info(f"Sampling {mol.smiles}")
+        logging.info(f"Sampling analogs for {mol.smiles}")
         sampler = StatePool(mol=mol, **state_pool_opt, model_client=model_client)
         tl = TimeLimit(time_limit)
         for _ in range(max_evolve_steps):
@@ -474,7 +473,7 @@ def _run_sampling_molecule(
             max_sim = max(
                 [
                     p.molecule.sim(
-                        input, FingerprintOption.morgan_for_tanimoto_similarity()
+                        mol, FingerprintOption.morgan_for_tanimoto_similarity()
                     )
                     for p in sampler.get_products()
                 ]
@@ -484,7 +483,7 @@ def _run_sampling_molecule(
                 break
 
         df = sampler.get_dataframe()[:max_results]
-        logging.info(f"Samples {len(df)} for {mol.smiles}")
+        logging.info(f"Sampled {len(df)} analogs for {mol.smiles}")
         return df
     except KeyboardInterrupt:
         return pd.DataFrame()

@@ -3,6 +3,7 @@ import os
 import random
 import time
 from pathlib import Path
+from typing import cast
 
 import crossover as co
 import joblib
@@ -11,6 +12,7 @@ import numpy as np
 import tdc
 import yaml
 from joblib import delayed
+from pydantic import BaseModel
 from rdkit import Chem, rdBase
 from rdkit.Chem.rdchem import Mol
 from tdc.generation import MolGen
@@ -25,19 +27,46 @@ rdBase.DisableLog("rdApp.error")
 logger = logging.getLogger(__name__)
 
 
-def sanitize(mol_list):
-    new_mol_list = []
-    smiles_set = set()
-    for mol in mol_list:
-        if mol is not None:
+class ScoredMol(BaseModel):
+    smiles: str
+    score: float | None = None
+    _mol: Mol | None = None
+
+    @property
+    def mol(self) -> Mol:
+        if self._mol is None:
+            self._mol = Chem.MolFromSmiles(self.smiles)
+        return self._mol  # type: ignore
+
+    def __lt__(self, other: "ScoredMol") -> bool:
+        if self.score is None:
+            return False
+        if other.score is None:
+            return True
+        return self.score < other.score
+
+    def __hash__(self) -> int:
+        return hash(self.smiles)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ScoredMol):
+            return False
+        return self.smiles == other.smiles
+
+
+# TODO: parallelize
+def sanitize_mols(mols: list[ScoredMol]) -> list[ScoredMol]:
+    mols_set = set()
+    for mol in mols:
+        if mol.mol is not None:
             try:
-                smiles = Chem.MolToSmiles(mol)
-                if smiles is not None and smiles not in smiles_set:
-                    smiles_set.add(smiles)
-                    new_mol_list.append(mol)
-            except ValueError:
-                logger.info("bad smiles")
-    return new_mol_list
+                smiles = Chem.MolToSmiles(mol.mol)
+                new_mol = ScoredMol(smiles=smiles)
+                if smiles is not None and new_mol not in mols_set:
+                    mols_set.add(new_mol)
+            except ValueError as e:
+                logger.info(f"Bad smiles: {e}")
+    return list(mols_set)
 
 
 def top_auc(buffer, top_n, finish, freq_log, max_oracle_calls):
@@ -69,134 +98,65 @@ def top_auc(buffer, top_n, finish, freq_log, max_oracle_calls):
 class Oracle:
     def __init__(
         self,
-        args=None,
-        mol_buffer={},
-        max_oracle_calls=10000,
-        freq_log=100,
-        oracle_name="SA",
-        evaluator_name="Diversity",
+        max_oracle_calls: int = 10000,
+        freq_log: int = 100,
+        oracle_name: str = "DRD2",
     ):
-        self.task_name = f"{oracle_name}_{evaluator_name}"
-        if args is None:
-            self.max_oracle_calls = max_oracle_calls
-            self.freq_log = freq_log
-        else:
-            self.args = args
-            self.max_oracle_calls = args.max_oracle_calls
-            self.freq_log = args.freq_log
-        self.mol_buffer = mol_buffer
+        self.oracle_name = oracle_name
+        self.max_oracle_calls = max_oracle_calls
+        self.freq_log = freq_log
+        self.mol_buffer: set[ScoredMol] = set()
         self.oracle = tdc.Oracle(name=oracle_name)
-        self.evaluator = tdc.Evaluator(name=evaluator_name)
+        self.sa_scorer = tdc.Oracle(name="SA")
+        self.diversity_evaluator = tdc.Evaluator(name="Diversity")
         self.last_log = 0
         self.output_dir = "output"
         os.makedirs(self.output_dir, exist_ok=True)
 
-    @property
-    def budget(self):
-        return self.max_oracle_calls
-
-    def assign_evaluator(self, evaluator):
-        self.evaluator = evaluator
-
-    def sort_buffer(self):
-        self.mol_buffer = dict(
-            sorted(self.mol_buffer.items(), key=lambda kv: kv[1][0], reverse=True)
+    def save_result(self, suffix=None):
+        output_file_path = os.path.join(
+            self.output_dir, f"results_{self.oracle_name}.yaml"
         )
 
-    def save_result(self, suffix=None):
-        if suffix is None:
-            output_file_path = os.path.join(self.output_dir, "results.yaml")
-        else:
-            output_file_path = os.path.join(
-                self.output_dir, "results_" + suffix + ".yaml"
-            )
-
-        self.sort_buffer()
         with open(output_file_path, "w") as f:
             yaml.dump(self.mol_buffer, f, sort_keys=False)
 
-    def log_intermediate(
-        self,
-        mols: list[Mol] | None = None,
-        scores: list[float] | None = None,
-        finish: bool = False,
-    ):
-        if finish:
-            temp_top100 = list(self.mol_buffer.items())[:100]
-            smis = [item[0] for item in temp_top100]
-            scores = [item[1][0] for item in temp_top100]
-            n_calls = self.max_oracle_calls
-        else:
-            if mols is None and scores is None:
-                if len(self.mol_buffer) <= self.max_oracle_calls:
-                    # If not spefcified, log current top-100 mols in buffer
-                    temp_top100 = list(self.mol_buffer.items())[:100]
-                    smis = [item[0] for item in temp_top100]
-                    scores = [item[1][0] for item in temp_top100]
-                    n_calls = len(self.mol_buffer)
-                else:
-                    results = list(
-                        sorted(
-                            self.mol_buffer.items(),
-                            key=lambda kv: kv[1][1],
-                            reverse=False,
-                        )
-                    )[: self.max_oracle_calls]
-                    temp_top100 = sorted(
-                        results, key=lambda kv: kv[1][0], reverse=True
-                    )[:100]
-                    smis = [item[0] for item in temp_top100]
-                    scores = [item[1][0] for item in temp_top100]
-                    n_calls = self.max_oracle_calls
-            else:
-                # Otherwise, log the input moleucles
-                assert mols is not None
-                smis = [Chem.MolToSmiles(m) for m in mols]
-                n_calls = len(self.mol_buffer)
+    def get_avg_scores(self, top_n: list[int]) -> list[float]:
+        mols = sorted(list(self.mol_buffer), reverse=True)
+        scores = np.array([mol.score for mol in mols])
 
-        # Uncomment this line if want to log top-10 moelucles figures, so as the best_mol key values.
-        # temp_top10 = list(self.mol_buffer.items())[:10]
+        avg_scores = []
+        for n in top_n:
+            avg_scores.append(scores[:n].mean())
+        return avg_scores
 
-        avg_top1 = np.max(scores)  # type: ignore
-        avg_top10 = np.mean(sorted(scores, reverse=True)[:10])  # type: ignore
-        avg_top100 = np.mean(scores)  # type: ignore
-        avg_sa = np.mean(self.oracle(smis))  # type: ignore
-        diversity_top100 = self.evaluator(smis)
+    def get_top_smiles(self, top_n: int = 100) -> list[str]:
+        mols = sorted(list(self.mol_buffer), reverse=True)
+        return [mol.smiles for mol in mols[:top_n]]
+
+    def log_intermediate(self):
+        smis = self.get_top_smiles(top_n=100)
+        n_calls = len(self.mol_buffer)
+
+        avg_top1, avg_top10, avg_top100 = self.get_avg_scores(top_n=[1, 10, 100])
+
+        sa_scores = np.array(self.sa_scorer(smis))
+        avg_sa = sa_scores.mean()
+        diversity_score = self.diversity_evaluator(smis)
 
         logger.info(
-            f"{n_calls}/{self.max_oracle_calls} | "
-            f"avg_top1: {avg_top1:.3f} | "
-            f"avg_top10: {avg_top10:.3f} | "
-            f"avg_top100: {avg_top100:.3f} | "
-            f"avg_sa: {avg_sa:.3f} | "
-            f"div: {diversity_top100:.3f}"
-        )
-
-        # try:
-        logger.info(
-            {
-                "avg_top1": avg_top1,
-                "avg_top10": avg_top10,
-                "avg_top100": avg_top100,
-                "auc_top1": top_auc(
-                    self.mol_buffer, 1, finish, self.freq_log, self.max_oracle_calls
-                ),
-                "auc_top10": top_auc(
-                    self.mol_buffer, 10, finish, self.freq_log, self.max_oracle_calls
-                ),
-                "auc_top100": top_auc(
-                    self.mol_buffer, 100, finish, self.freq_log, self.max_oracle_calls
-                ),
-                "avg_sa": avg_sa,
-                "diversity_top100": diversity_top100,
-                "n_oracle": n_calls,
-            }
+            f"calls: {n_calls}/{self.max_oracle_calls} | "
+            f"top1: {avg_top1:.3f} | "
+            f"top10: {avg_top10:.3f} | "
+            f"top100: {avg_top100:.3f} | "
+            f"sa: {avg_sa:.3f} | "
+            f"div: {diversity_score:.3f}"
         )
 
     def __len__(self):
         return len(self.mol_buffer)
 
-    def score_smi(self, smi):
+    def _score_mol(self, mol: ScoredMol):
         """
         Function to score one molecule
 
@@ -206,61 +166,40 @@ class Oracle:
         Return:
             score: a float represents the property of the molecule.
         """
-        if len(self.mol_buffer) > self.max_oracle_calls:
-            return 0
-        if smi is None:
-            return 0
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None or len(smi) == 0:
-            return 0
-        else:
-            smi = Chem.MolToSmiles(mol)
-            if smi in self.mol_buffer:
-                pass
-            else:
-                self.mol_buffer[smi] = [
-                    float(self.evaluator(smi)),  # type: ignore
-                    len(self.mol_buffer) + 1,
-                ]
-            return self.mol_buffer[smi][0]
+        assert mol.smiles is not None
+        assert len(self.mol_buffer) < self.max_oracle_calls
 
-    def __call__(self, smiles_lst):
+        if mol not in self.mol_buffer:
+            mol.score = float(self.oracle(mol.smiles))  # type: ignore
+            self.mol_buffer.add(mol)
+
+    def __call__(self, mols: list[ScoredMol]):
+        """Score a list of molecules
+
+        Args:
+            smiles_lst: A list of SMILES strings
+
+        Returns:
+            A list of scores
         """
-        Score
-        """
-        if isinstance(smiles_lst, list):
-            score_list = []
-            for smi in smiles_lst:
-                score_list.append(self.score_smi(smi))
-                if (
-                    len(self.mol_buffer) % self.freq_log == 0
-                    and len(self.mol_buffer) > self.last_log
-                ):
-                    self.sort_buffer()
-                    self.log_intermediate()
-                    self.last_log = len(self.mol_buffer)
-                    self.save_result(suffix=self.task_name)
-        else:
-            score_list = self.score_smi(smiles_lst)
-            if (
-                len(self.mol_buffer) % self.freq_log == 0
-                and len(self.mol_buffer) > self.last_log
-            ):
-                self.sort_buffer()
+        for mol in mols:
+            if len(self.mol_buffer) >= self.max_oracle_calls:
+                break
+
+            self._score_mol(mol)
+            if len(self.mol_buffer) % self.freq_log == 0:
                 self.log_intermediate()
-                self.last_log = len(self.mol_buffer)
-                self.save_result(suffix=self.task_name)
-        return score_list
+                self.save_result()
 
     @property
-    def finish(self):
+    def finished(self):
         return len(self.mol_buffer) >= self.max_oracle_calls
 
 
 MINIMUM = 1e-10
 
 
-def make_mating_pool(population_mol: list[Mol], population_scores, offspring_size: int):
+def make_mating_pool(mols: list[ScoredMol], size: int):
     """
     Given a population of RDKit Mol and their scores, sample a list of the same size
     with replacement using the population_scores as weights
@@ -271,38 +210,41 @@ def make_mating_pool(population_mol: list[Mol], population_scores, offspring_siz
     Returns: a list of RDKit Mol (probably not unique)
     """
     # scores -> probs
-    population_scores = [s + MINIMUM for s in population_scores]
-    sum_scores = sum(population_scores)
-    population_probs = [p / sum_scores for p in population_scores]
-    mating_pool = np.random.choice(
-        population_mol, p=population_probs, size=offspring_size, replace=True
-    )
-    return mating_pool
+    scores = []
+    for mol in mols:
+        assert mol.score is not None
+        scores.append(mol.score + MINIMUM)
+    sum_scores = sum(scores)
+    probs = [p / sum_scores for p in scores]
+    return random.choices(mols, weights=probs, k=size)
 
 
-def reproduce(mating_pool, mutation_rate):
+def reproduce(mating_pool_mols: list[ScoredMol], mutation_rate: float) -> ScoredMol:
     """
     Args:
         mating_pool: list of RDKit Mol
         mutation_rate: rate of mutation
     Returns:
     """
-    parent_a = random.choice(mating_pool)
-    parent_b = random.choice(mating_pool)
+    parent_a_mol = random.choice(mating_pool_mols)
+    parent_b_mol = random.choice(mating_pool_mols)
     try:
-        new_child = co.crossover(parent_a, parent_b)
-        if new_child is not None:
-            new_child = mu.mutate(new_child, mutation_rate)
-        return new_child
-    except ValueError:
-        return parent_a
+        new_child_mol = co.crossover(parent_a_mol.mol, parent_b_mol.mol)
+        if new_child_mol is not None:
+            new_child_mol = mu.mutate(new_child_mol, mutation_rate)
+        return ScoredMol(smiles=Chem.MolToSmiles(new_child_mol))
+    except ValueError as e:
+        logger.debug(f"Crossover failed: {e}")
+        return parent_a_mol
 
 
-def projection(smiles_list: list[str], model_client: SynformerClient) -> list[str]:
+def project_to_closest_synthesizable_mols(
+    mols: list[ScoredMol], model_client: SynformerClient
+) -> list[ScoredMol]:
     t = time.perf_counter()
-    input = [Molecule(s) for s in smiles_list]
+    molecules = [Molecule(mol.smiles) for mol in mols]
     result_df = run_sampling(
-        mols=input,
+        mols=molecules,
         search_width=24,
         exhaustiveness=64,
         time_limit=180,
@@ -316,7 +258,7 @@ def projection(smiles_list: list[str], model_client: SynformerClient) -> list[st
         f"Projection returned {len(out_smiles_list)} in "
         f"{time.perf_counter() - t:.2f} seconds"
     )
-    return out_smiles_list
+    return [ScoredMol(smiles=smi, score=None) for smi in out_smiles_list]
 
 
 if __name__ == "__main__":
@@ -331,9 +273,9 @@ if __name__ == "__main__":
         default=Path("data/trained_weights/sf_ed_default.ckpt"),
     )
     parser.add_argument("--max_oracle_calls", type=int, default=10000)
-    parser.add_argument("--freq_log", type=int, default=100)
-    parser.add_argument("--population_size", type=int, default=100)
-    parser.add_argument("--offspring_size", type=int, default=100)
+    parser.add_argument("--freq_log", type=int, default=10)
+    parser.add_argument("--population_size", type=int, default=10)
+    parser.add_argument("--offspring_size", type=int, default=10)
     parser.add_argument("--mutation_rate", type=float, default=0.1)
     parser.add_argument(
         "--mol_dataset", type=str, default="zinc", choices=single_molecule_dataset_names
@@ -354,90 +296,76 @@ if __name__ == "__main__":
     model_server.start()
 
     oracle = Oracle(
-        args=args,
         max_oracle_calls=args.max_oracle_calls,
         freq_log=args.freq_log,
         oracle_name=args.oracle,
-        evaluator_name=args.evaluator,
     )
 
-    pool = joblib.Parallel(n_jobs=64)
-
+    logger.info("Loading dataset")
     data = MolGen(name=args.mol_dataset)
     all_smiles = data.get_data().smiles.to_list()  # type: ignore
-    starting_population = np.random.choice(all_smiles, args.population_size)
 
     # select initial population
-    # population_smiles = heapq.nlargest(config["population_size"], starting_population, key=oracle)
-    population_smiles = starting_population
-    population_smiles = projection(
-        population_smiles, model_client=model_server.get_client()
+    logger.info("Projecting initial population to synthesizable mols")
+    population_smiles_list = np.random.choice(all_smiles, args.population_size)
+    population_mols = [
+        ScoredMol(smiles=smi, score=None) for smi in population_smiles_list
+    ]
+    population_mols = project_to_closest_synthesizable_mols(
+        population_mols, model_client=model_server.get_client()
     )
-    population_mol = [Chem.MolFromSmiles(s) for s in population_smiles]
-    population_scores = oracle([Chem.MolToSmiles(mol) for mol in population_mol])
 
-    patience = 0
+    logger.info("Scoring initial population")
+    # TODO: parallelize
+    oracle(population_mols)
 
     while True:
         if len(oracle) > 100:
-            oracle.sort_buffer()
-            old_score = np.mean(
-                [item[1][0] for item in list(oracle.mol_buffer.items())[:100]]
-            )
+            prev_score = oracle.get_avg_scores(top_n=[100])[0]
         else:
-            old_score = 0
+            prev_score = 0
 
         # new_population
-        mating_pool = make_mating_pool(
-            population_mol, population_scores, args.population_size
-        )
-        offspring_mol = list(
-            pool(
-                delayed(reproduce)(mating_pool, args.mutation_rate)
-                for _ in range(args.offspring_size)
-            )
-        )
+        logger.info("Making mating pool")
+        mating_pool_mols = make_mating_pool(population_mols, args.population_size)
 
-        # add new_population
-        population_mol += offspring_mol
-        population_mol = sanitize(population_mol)
-        population_mol = [
-            Chem.MolFromSmiles(smi)
-            for smi in projection(
-                [Chem.MolToSmiles(mol) for mol in population_mol],
-                model_client=model_server.get_client(),
-            )
+        logger.info("Making offspring")
+        offspring_mols = [
+            reproduce(mating_pool_mols, args.mutation_rate)
+            for _ in range(args.offspring_size)
         ]
+
+        logger.info("Projecting offspring to synthesizable mols")
+        offspring_mols = sanitize_mols(offspring_mols)
+        offspring_mols = project_to_closest_synthesizable_mols(
+            offspring_mols,
+            model_client=model_server.get_client(),
+        )
 
         # stats
-        old_scores = population_scores
-        population_scores = oracle([Chem.MolToSmiles(mol) for mol in population_mol])
-        population_tuples = list(zip(population_scores, population_mol))  # type: ignore
-        population_tuples = sorted(population_tuples, key=lambda x: x[0], reverse=True)[
-            : args.population_size
-        ]
-        population_mol = [t[1] for t in population_tuples]
-        population_scores = [t[0] for t in population_tuples]
+        logger.info("Scoring offspring")
+        oracle(offspring_mols)
 
-        ### early stopping
-        if len(oracle) > 100:
-            oracle.sort_buffer()
-            new_score = np.mean(
-                [item[1][0] for item in list(oracle.mol_buffer.items())[:100]]
-            )
-            # import ipdb; ipdb.set_trace()
-            if (new_score - old_score) < 1e-3:
-                patience += 1
-                if patience >= 5:
-                    oracle.log_intermediate(finish=True)
-                    logger.info("convergence criteria met, abort ...... ")
-                    break
-            else:
-                patience = 0
+        # ### early stopping
+        # logger.info("Checking for convergence")
+        # if len(oracle) > 100:
+        #     new_score = np.mean(
+        #         [item[1][0] for item in list(oracle.mol_buffer.items())[:100]]
+        #     )
+        #     # import ipdb; ipdb.set_trace()
+        #     if (new_score - prev_score) < 1e-3:
+        #         patience += 1
+        #         if patience >= 5:
+        #             oracle.log_intermediate(finish=True)
+        #             logger.info("convergence criteria met, abort ...... ")
+        #             break
+        #     else:
+        #         patience = 0
 
-            old_score = new_score
+        #     prev_score = new_score
 
-        if oracle.finish:
+        if oracle.finished:
+            logger.info("Finished")
             break
 
-        oracle.save_result(suffix=args.name)
+        oracle.save_result()

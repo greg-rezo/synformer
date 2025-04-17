@@ -183,7 +183,7 @@ class StatePool:
 
             elif tok_next == TokenType.REACTANT:
                 if j >= len(top_reactants[i]):
-                    logger.warning(
+                    logger.debug(
                         f"Not enough reactants for state {i}, j={j} >= {len(top_reactants[i])}"
                     )
                     continue
