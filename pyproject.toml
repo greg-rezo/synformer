@@ -13,26 +13,22 @@ requires-python = ">=3.10"
 dynamic = ["version", "dependencies"]
 
 
-# download assets on installation
-#[build-system]
-#requires = [
-#  "setuptools>=61.0",
-#  "wheel",
-#  "requests"
-#]
-#build-backend = "download_artifacts"
-#backend-path = ["."]
-
-[tool.setuptools]
-packages = ["synformer"]
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [tool.setuptools.dynamic]
-version = {attr = "synformer.__version__"}
-dependencies = {file = ["requirements.txt"]}
+version = { attr = "synformer.__version__" }
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["synformer", "synformer.*"]
 
 [tool.setuptools.package-data]
-# Specify patterns for files within your package that should be included
-"*" = ["*.md", "*.txt", "*.csv", "data/*"]
+"synformer" = ["*.md", "*.txt", "*.csv", "data/*"]
+
+
 
 [tool.black]
 line-length = 119

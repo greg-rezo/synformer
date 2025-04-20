@@ -21,7 +21,7 @@ from synformer.data.collate import (
     collate_tokens,
 )
 from synformer.data.common import TokenType, featurize_stack
-from synformer.models.model_server_client import SynformerClient
+from synformer.models.model_interface import SynformerInterface
 
 logger = logging.getLogger(__name__)
 
@@ -65,14 +65,14 @@ class StatePool:
     def __init__(
         self,
         mol: Molecule,
-        model_client: SynformerClient,
+        model_interface: SynformerInterface,
         fpindex: FingerprintIndex,
         rxn_matrix: ReactantReactionMatrix,
         factor: int = 16,
         max_active_states: int = 256,
         sort_by_score: bool = True,
     ) -> None:
-        self._model_client = model_client
+        self._model_interface = model_interface
         self._fpindex = fpindex
         self._rxn_matrix = rxn_matrix
         self._mol = mol
@@ -96,16 +96,15 @@ class StatePool:
     @cached_property
     def code(self) -> tuple[torch.Tensor, torch.Tensor]:
         with torch.inference_mode():
-            code, code_padding_mask, encoder_loss_dict = self._model_client.predict(
+            code, code_padding_mask, encoder_loss_dict = self._model_interface.encode(  # type: ignore
                 {
                     "atoms": self._atoms,
                     "bonds": self._bonds,
                     "atom_padding_mask": self._atom_padding_mask,
                     "smiles": self._smiles,
                 },
-                encode=True,
             )
-            return code, code_padding_mask
+            return code, code_padding_mask  # type: ignore
 
     def _sort_states(self) -> None:
         if self._sort_by_score:
@@ -161,7 +160,7 @@ class StatePool:
             "topk": self._factor,
             "result_device": torch.device("cpu"),
         }
-        result = self._model_client.predict(input_data)
+        result = self._model_interface.predict(input_data)  # type: ignore
 
         n = code.size(0)
         m = self._factor
@@ -192,15 +191,17 @@ class StatePool:
 
                 reactant, mol_idx, score = top_reactants[i][j]
                 new_state = copy.deepcopy(base_state)
-                new_state.stack.push_mol(reactant, mol_idx)
-                new_state.scores.append(score)
+                new_state.stack.push_mol(reactant, mol_idx)  # type: ignore
+                new_state.scores.append(score)  # type: ignore
                 next.append(new_state)
 
             elif tok_next == TokenType.REACTION:
                 reaction, rxn_idx, score = top_reactions[i][j]
                 new_state = copy.deepcopy(base_state)
                 success = new_state.stack.push_rxn(
-                    reaction, rxn_idx, product_limit=None
+                    reaction,  # type: ignore
+                    rxn_idx,  # type: ignore
+                    product_limit=None,
                 )
                 if success:
                     rxn_score = max(

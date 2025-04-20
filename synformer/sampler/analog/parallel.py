@@ -7,8 +7,6 @@ import pickle
 import subprocess
 import time
 import warnings
-from concurrent.futures import ProcessPoolExecutor
-from functools import partial
 from multiprocessing import synchronize as sync
 from typing import TypeAlias
 
@@ -21,7 +19,7 @@ from tqdm.auto import tqdm
 from synformer.chem.fpindex import FingerprintIndex
 from synformer.chem.matrix import ReactantReactionMatrix
 from synformer.chem.mol import FingerprintOption, Molecule
-from synformer.models.model_server_client import SynformerClient
+from synformer.models.model_interface import SynformerInterface
 from synformer.models.synformer import Synformer
 from synformer.sampler.analog.state_pool import StatePool, TimeLimit
 
@@ -191,14 +189,14 @@ class WorkerNoStop(mp.Process):
         self,
         task_queue: TaskQueueType,
         result_queue: ResultQueueType,
-        model_client: SynformerClient,
+        model_interface: SynformerInterface,
         state_pool_opt: dict | None = None,
         max_evolve_steps: int = 12,
         max_results: int = 100,
         time_limit: int = 120,
     ):
         super().__init__()
-        self._model_client = model_client
+        self._model_interface = model_interface
         self._task_queue = task_queue
         self._result_queue = result_queue
 
@@ -231,7 +229,7 @@ class WorkerNoStop(mp.Process):
     def process(self, mol: Molecule):
         sampler = StatePool(
             mol=mol,
-            model_client=self._model_client,
+            model_interface=self._model_interface,
             **self._state_pool_opt,
         )
         tl = TimeLimit(self._time_limit)
@@ -245,7 +243,7 @@ class WorkerNoStop(mp.Process):
 class WorkerPoolNoStop:
     def __init__(
         self,
-        model_client: SynformerClient,
+        model_interface: SynformerInterface,
         num_workers_per_gpu: int,
         task_qsize: int,
         result_qsize: int,
@@ -254,13 +252,13 @@ class WorkerPoolNoStop:
         super().__init__()
         self._task_queue: TaskQueueType = mp.JoinableQueue(task_qsize)
         self._result_queue: ResultQueueType = mp.Queue(result_qsize)
-        self._model_client = model_client
+        self._model_interface = model_interface
         num_workers = num_workers_per_gpu
         self._workers = [
             WorkerNoStop(
                 task_queue=self._task_queue,
                 result_queue=self._result_queue,
-                model_client=self._model_client,
+                model_interface=self._model_interface,
                 **worker_opt,
             )
             for i in range(num_workers)
@@ -417,7 +415,7 @@ def run_parallel_sampling_return_smiles(
 
 def run_parallel_sampling_return_smiles_no_early_stop(
     input: list[Molecule],
-    model_client: SynformerClient,
+    model_interface: SynformerInterface,
     search_width: int = 24,
     exhaustiveness: int = 64,
     num_gpus: int = -1,
@@ -429,7 +427,7 @@ def run_parallel_sampling_return_smiles_no_early_stop(
 ) -> None:
     num_gpus = num_gpus if num_gpus > 0 else _count_gpus()
     pool = WorkerPoolNoStop(
-        model_client=model_client,
+        model_interface=model_interface,
         num_workers_per_gpu=num_workers_per_gpu,
         task_qsize=task_qsize,
         result_qsize=result_qsize,
@@ -468,18 +466,16 @@ def _run_sampling_molecule(
     max_results: int,
     fpindex: FingerprintIndex,
     rxn_matrix: ReactantReactionMatrix,
-    model_client: SynformerClient,
+    model_interface: SynformerInterface,
 ) -> bytes:
     logging.basicConfig(level=logging.INFO)
     warnings.filterwarnings("ignore")
 
     try:
-        # logger.info(f"Sampling {mol.smiles} on process {os.getpid()}")
-        t = time.perf_counter()
         sampler = StatePool(
             mol=mol,
             **state_pool_opt,
-            model_client=model_client,
+            model_interface=model_interface,
             fpindex=fpindex,
             rxn_matrix=rxn_matrix,
         )
@@ -501,9 +497,6 @@ def _run_sampling_molecule(
         df = sampler.get_dataframe().drop_duplicates(subset="smiles")
         df = df.sort_values(by="score", ascending=False)
         df = df.iloc[:max_results]
-        # logger.info(
-        #     f"Sampled {len(df)} analogs for {mol.smiles} in {time.perf_counter() - t:.2f}s on process {os.getpid()}"
-        # )
         return df.to_parquet()
     except KeyboardInterrupt:
         return pd.DataFrame().to_parquet()
@@ -519,7 +512,7 @@ def run_sampling(
     mols: list[Molecule],
     fpindex: FingerprintIndex,
     rxn_matrix: ReactantReactionMatrix,
-    model_client: SynformerClient,
+    model_interface: SynformerInterface,
     search_width: int = 24,
     exhaustiveness: int = 64,
     time_limit: int = 180,
@@ -527,6 +520,22 @@ def run_sampling(
     max_evolve_steps: int = 12,
     sort_by_scores: bool = True,
 ) -> pd.DataFrame:
+    """Sample analogs for a list of molecules.
+
+    Runs in parallel.
+
+    Args:
+        mols: A list of molecules to sample analogs for.
+        fpindex: The fingerprint index to use for sampling.
+        rxn_matrix: The reaction matrix to use for sampling.
+        model_interface: The model interface to use for sampling.
+        search_width: Beam search top-k.
+        exhaustiveness: Beam search width.
+        time_limit: Time limit for each sampling run.
+        max_results: Maximum number of results to return.
+        max_evolve_steps: Maximum number of evolution steps.
+        sort_by_scores: Whether to sort the results by scores.
+    """
     # logger.info(f"Running sampling for {len(mols)} molecules")
 
     state_pool_opt = {
@@ -542,7 +551,7 @@ def run_sampling(
     # Put shared objects into Ray's object store
     fpindex_ref = ray.put(fpindex)
     rxn_matrix_ref = ray.put(rxn_matrix)
-    model_client_ref = ray.put(model_client)
+    model_interface_ref = ray.put(model_interface)
 
     # Launch remote tasks for each molecule using the Ray remote function
     futures = [
@@ -554,7 +563,7 @@ def run_sampling(
             max_results,
             fpindex_ref,
             rxn_matrix_ref,
-            model_client_ref,
+            model_interface_ref,
         )
         for mol in mols
     ]
@@ -566,3 +575,37 @@ def run_sampling(
 
     dfs = [pd.read_parquet(io.BytesIO(b)) for b in bytes_list]
     return pd.concat(dfs, ignore_index=True)
+
+
+def project_to_synthesizable(
+    smiles_list: list[str],
+    fpindex: FingerprintIndex,
+    rxn_matrix: ReactantReactionMatrix,
+    model_interface: SynformerInterface,
+    search_width: int = 24,
+    exhaustiveness: int = 64,
+    time_limit: int = 180,
+    max_results: int = 100,
+) -> dict[str, tuple[str, float]]:
+    t = time.perf_counter()
+    molecules = [Molecule(smi) for smi in smiles_list]
+    result_df = run_sampling(
+        fpindex=fpindex,
+        rxn_matrix=rxn_matrix,
+        model_interface=model_interface,
+        mols=molecules,
+        search_width=search_width,
+        exhaustiveness=exhaustiveness,
+        time_limit=time_limit,
+        sort_by_scores=True,
+        max_results=max_results,
+    )
+    result_df = result_df.sort_values(by="score", ascending=False)
+    result_df = result_df.drop_duplicates(subset="target", keep="first")
+
+    logger.info(
+        f"Projection returned {len(result_df)} smiles in "
+        f"{time.perf_counter() - t:.2f} seconds"
+    )
+    orig_to_new = {row["target"]: (row["smiles"], row["score"]) for _, row in result_df.iterrows()}
+    return orig_to_new

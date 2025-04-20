@@ -1,6 +1,8 @@
 import dataclasses
+import pathlib
 
 import torch
+from omegaconf import OmegaConf
 from torch import nn
 from tqdm.auto import tqdm
 
@@ -478,6 +480,15 @@ class Synformer(nn.Module):
             reactants=reactants,
             reactions=reactions,
         )
+
+    @classmethod
+    def load_from_checkpoint(cls, file: str | pathlib.Path):
+        """LoOmegaConfl from a checkpoint file."""
+        ckpt = torch.load(file, map_location="cpu")
+        config = OmegaConf.create(ckpt["hyper_parameters"]["config"])
+        model = Synformer(config.model)
+        model.load_state_dict({k[6:]: v for k, v in ckpt["state_dict"].items()})
+        return model
 
 
 def draw_generation_results(result: GenerateResult):

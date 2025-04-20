@@ -22,7 +22,7 @@ from synformer.chem.fpindex import FingerprintIndex
 from synformer.chem.matrix import ReactantReactionMatrix
 from synformer.chem.mol import Molecule
 from synformer.models.model_server import launch_server_process
-from synformer.models.model_server_client import SynformerClient
+from synformer.models.model_interface import SynformerClient
 from synformer.sampler.analog.parallel import run_sampling
 
 GLOBAL_POOL = ProcessPoolExecutor(mp_context=mp.get_context("spawn"))

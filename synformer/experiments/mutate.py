@@ -1,9 +1,10 @@
 import random
 
-import crossover as co
 import numpy as np
 from rdkit import Chem, rdBase
 from rdkit.Chem import AllChem
+
+from synformer.experiments.crossover import mol_ok, ring_OK
 
 rdBase.DisableLog("rdApp.error")
 
@@ -140,7 +141,7 @@ def mutate(mol, mutation_rate):
         for m in new_mol_trial:
             m = m[0]
             # print Chem.MolToSmiles(mol),mol_ok(mol)
-            if co.mol_ok(m) and co.ring_OK(m):
+            if mol_ok(m) and ring_OK(m):
                 new_mols.append(m)
 
         if len(new_mols) > 0:
