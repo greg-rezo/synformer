@@ -4,7 +4,9 @@ import itertools
 import logging
 import time
 from collections.abc import Iterable
+from dataclasses import fields
 from functools import cached_property
+from typing import Any
 
 import pandas as pd
 import torch
@@ -21,9 +23,28 @@ from synformer.data.collate import (
     collate_tokens,
 )
 from synformer.data.common import TokenType, featurize_stack
-from synformer.models.model_interface import SynformerInterface
+from synformer.models.encoder.base import EncoderOutput
+from synformer.models.synformer import PredictResult, Synformer
 
 logger = logging.getLogger(__name__)
+
+
+def to_device(obj: Any, device: torch.device) -> Any:
+    """Move an object to a device."""
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device)
+    elif isinstance(obj, dict):
+        return {k: to_device(v, device) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return type(obj)(to_device(v, device) for v in obj)
+    elif isinstance(obj, (EncoderOutput, PredictResult)):
+        return type(obj)(
+            **{
+                field.name: to_device(getattr(obj, field.name), device)
+                for field in fields(obj)
+            }
+        )
+    return obj
 
 
 @dataclasses.dataclass
@@ -65,14 +86,14 @@ class StatePool:
     def __init__(
         self,
         mol: Molecule,
-        model_interface: SynformerInterface,
+        model: Synformer,
         fpindex: FingerprintIndex,
         rxn_matrix: ReactantReactionMatrix,
         factor: int = 16,
         max_active_states: int = 256,
         sort_by_score: bool = True,
     ) -> None:
-        self._model_interface = model_interface
+        self._model = model
         self._fpindex = fpindex
         self._rxn_matrix = rxn_matrix
         self._mol = mol
@@ -96,14 +117,18 @@ class StatePool:
     @cached_property
     def code(self) -> tuple[torch.Tensor, torch.Tensor]:
         with torch.inference_mode():
-            code, code_padding_mask, encoder_loss_dict = self._model_interface.encode(  # type: ignore
-                {
-                    "atoms": self._atoms,
-                    "bonds": self._bonds,
-                    "atom_padding_mask": self._atom_padding_mask,
-                    "smiles": self._smiles,
-                },
+            inputs = {
+                "atoms": self._atoms,
+                "bonds": self._bonds,
+                "atom_padding_mask": self._atom_padding_mask,
+                "smiles": self._smiles,
+            }
+            inputs = to_device(inputs, torch.device("cuda"))
+            code, code_padding_mask, encoder_loss_dict = self._model.encode(  # type: ignore
+                inputs,
             )
+            code = to_device(code, torch.device("cpu"))
+            code_padding_mask = to_device(code_padding_mask, torch.device("cpu"))
             return code, code_padding_mask  # type: ignore
 
     def _sort_states(self) -> None:
@@ -159,8 +184,12 @@ class StatePool:
             "reactant_fps": feat["reactant_fps"],
             "topk": self._factor,
             "result_device": torch.device("cpu"),
+            "fpindex": self._fpindex,
+            "rxn_matrix": self._rxn_matrix,
         }
-        result = self._model_interface.predict(input_data)  # type: ignore
+        input_data = to_device(input_data, torch.device("cuda"))
+        result = self._model.predict(**input_data)  # type: ignore
+        result = to_device(result, torch.device("cpu"))
 
         n = code.size(0)
         m = self._factor

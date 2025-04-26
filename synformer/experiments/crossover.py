@@ -131,7 +131,9 @@ def crossover_ring(parent_A, parent_B):
             new_mol_trial = []
             for fa in fragments_A:
                 for fb in fragments_B:
-                    new_mol_trial.append(rxn1.RunReactants((fa, fb))[0])
+                    products = rxn1.RunReactants((fa, fb))
+                    if len(products) > 0:
+                        new_mol_trial.append(products[0])
 
         new_mols = []
         for rs in rxn_smarts2:
